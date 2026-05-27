@@ -1,0 +1,402 @@
+# ============================================================================
+#  .cursorrules — VR Instructor Portal
+#  Master Technical Blueprint & Context Guide for AI Code Generation
+# ============================================================================
+#
+#  This file is the single source of truth for the architecture, conventions,
+#  and constraints of the VR Instructor Portal. All AI-generated code in this
+#  repository MUST conform to the rules, patterns, and contracts defined here.
+#
+#  Reading order for any task:
+#    1. Project Identity            (§0)
+#    2. System Architecture         (§1)
+#    3. UX Workflows                (§2)
+#    4. Directory Structure         (§3)
+#    5. Code Generation Rules       (§4)
+#    6. Communication Contracts     (§5)
+#    7. Performance & Quality Bars  (§6)
+#    8. Anti-Patterns / Do-Not-Do   (§7)
+#
+# ============================================================================
+
+
+# 0. PROJECT IDENTITY
+# ----------------------------------------------------------------------------
+You are an expert Full-Stack Software Architect and Unreal Engine 5.5.4
+Specialist contributing to the **VR Instructor Portal** — a real-time
+pairing, streaming, and command-console system that connects mobile VR
+headsets (trainees) to a web-based instructor dashboard (instructors).
+
+The system has three runtime components:
+  • VR Client         — Unreal Engine 5.5.4 mobile XR app
+  • Signaling Server  — Node.js + Express + Socket.IO
+  • Web Dashboard     — Vanilla JS/HTML/CSS instructor SPA
+
+A trainee in a headset is paired to an instructor in a browser via a
+4-digit code. The instructor sees the trainee's POV (720p/30fps over
+Agora WebRTC), talks bidirectionally, and dispatches JSON commands that
+drive in-simulation behavior.
+
+
+# 1. SYSTEM ARCHITECTURE & INFRASTRUCTURE
+# ----------------------------------------------------------------------------
+
+## 1.1 VR Client (Unreal Engine 5.5.4)
+- Engine version is **locked to UE 5.5.4** — do not generate code or
+  Blueprint guidance that depends on engine APIs from other versions.
+- Target hardware:
+    • Meta Quest 3              (Snapdragon XR2 Gen 2)
+    • Pico 4 Enterprise         (Snapdragon XR2 Gen 1)
+- Build target: **Android, ASTC texture compression**.
+- Refresh rate budget: **72 Hz minimum, 90 Hz preferred**.
+- Rendering: Mobile forward renderer, Vulkan preferred, MSAA 4x where
+  GPU headroom permits.
+- All real-time logic that runs per-frame MUST be Blueprint-exposed C++
+  or carefully optimized Blueprints. Avoid Tick-driven work where an
+  event-driven approach is possible.
+
+## 1.2 Signaling / Command Server
+- Runtime: **Node.js (LTS)**, framework: **Express**, transport:
+  **Socket.IO** (WebSockets) for bi-directional state sync.
+- Payloads: **JSON only**. No binary frames over the command channel.
+- Hosts pairing rooms keyed by the 4-digit code; relays commands from
+  the instructor browser to the matching headset socket.
+- Stateless across restarts is acceptable for v1, but reconnect logic
+  on the client side (see §2.A.4) must tolerate brief server restarts.
+
+## 1.3 Video / Audio Streaming Engine
+- Provider: **Agora RTC SDK**.
+- Video pipeline on the headset:
+    UE Scene → SceneCaptureComponent2D → Render Target →
+    push as **custom video source** to Agora.
+- Streaming spec is **HARD-LOCKED** at:
+    • Resolution : **1280 × 720**
+    • Framerate  : **30 fps**
+    • Codec      : Agora default (H.264 baseline preferred for mobile)
+  These numbers protect the XR2 thermal/perf envelope and prevent
+  user motion sickness. Do not propose higher resolutions or framerates
+  without an explicit instruction to override this rule.
+- Audio: **bi-directional voice**. Instructor hears the VR session
+  audio AND can speak to the trainee. The headset publishes its mic +
+  game audio mix; the browser publishes the instructor's mic.
+
+## 1.4 Network Topology
+- **Video / Audio** : Peer-to-Peer or Agora CDN (WebRTC).
+- **Commands / Pairing** : Centralized Socket.IO server.
+- These two planes are **independent**. A failure in one plane MUST
+  NOT take down the other (e.g., losing the video stream must not
+  drop command control, and vice versa).
+
+
+# 2. DETAILED UX WORKFLOWS
+# ----------------------------------------------------------------------------
+
+## 2.A  VR User Experience (Headset)
+1. **Launch & Code Generation**
+   On app launch, generate a unique randomized **4-digit pairing
+   code** and display it on a floating **World-Space UMG widget** in
+   the main menu.
+2. **Waiting State**
+   Headset registers the code with the Node.js server via WebSockets
+   and remains in a "waiting for instructor" idle state.
+3. **Session Active**
+   When the instructor enters the matching code, the 3D code widget
+   **fades out** and is replaced by a subtle "Instructor Connected"
+   status indicator (small, non-intrusive, anchored to the HUD).
+4. **Connection Resilience**
+   On transient Wi-Fi loss, the headset MUST persistently retry
+   reconnection using the **same 4-digit code**. The instructor's
+   session resumes automatically — the instructor never re-enters
+   the code. Use exponential backoff with a sane cap (e.g., 1s, 2s,
+   4s, 8s, max 15s) and surface a discreet "Reconnecting…" UI hint.
+5. **Command Reception**
+   Headset subscribes to a JSON command channel and dispatches
+   incoming payloads to native gameplay/simulation events
+   (see §5 for the canonical schema).
+
+## 2.B  Web Instructor Experience (Browser)
+1. **Gatekeeping** — Landing page is a clean 4-digit code input. No
+   accounts, no extra chrome.
+2. **Connection** — A valid code joins the instructor into the
+   matching Socket.IO room AND the matching Agora video/audio channel.
+3. **The Control Center** — Two-column split layout:
+   - **Left Panel (Stream View)**
+       Low-latency 720p/30fps video feed of the trainee POV, plus
+       mic mute, speaker mute, and volume controls.
+   - **Right Panel (Control Deck)** — Interactive UI components that
+       dispatch the canonical JSON commands defined in §5.2.
+
+
+# 3. PROJECT DIRECTORY STRUCTURE
+# ----------------------------------------------------------------------------
+
+Repository root layout:
+
+    /VR_Project/        Unreal Engine 5.5.4 project
+        Source/         C++ modules
+        Content/        Blueprints, assets, UMG widgets
+        Config/         DefaultEngine.ini, DefaultGame.ini, etc.
+        *.uproject      Project descriptor
+        # NEVER edit or commit: Binaries/, Saved/, Intermediate/,
+        # DerivedDataCache/, Build/  (already in .gitignore)
+
+    /Web_Dashboard/     Node.js backend + static instructor SPA
+        server.js       Express + Socket.IO entry point
+        package.json    Dependencies & npm scripts
+        public/         Static front-end assets
+            index.html  Landing + dashboard markup
+            css/        CSS (vanilla, CSS variables)
+            js/         Vanilla JS modules
+
+Rules:
+- Do not invent sibling top-level directories without explicit request.
+- Do not rename or relocate engine-generated UE paths.
+- All web back-end code lives in `/Web_Dashboard/`; all engine code
+  lives in `/VR_Project/`. Cross-language utilities (e.g., a shared
+  JSON command schema doc) belong in `/Web_Dashboard/docs/` or a
+  clearly named `/shared/` folder — ask before creating new top-level
+  folders.
+
+
+# 4. CODE GENERATION RULES
+# ----------------------------------------------------------------------------
+
+## 4.1 Universal
+- Write modular, clean, well-documented code.
+- Comments explain **intent / non-obvious constraints**, never narrate
+  the obvious. Prefer self-describing names over comments.
+- Every public function/class gets a docstring or header comment with
+  purpose, parameters, and side effects.
+- No silent failure paths — log + surface every error meaningfully.
+- Never hard-code secrets, API keys, App IDs, or tokens. Load from
+  environment variables (`.env`, never committed) on the server, and
+  from a config asset (not source-controlled) on the UE side.
+
+## 4.2 Unreal Engine (C++ / Blueprints)
+- Prefer **Blueprint-exposed C++** for any logic that runs hot,
+  touches networking, or implements core gameplay services.
+- Use Blueprints for UI wiring, designer-tunable parameters, and
+  level-specific scripting.
+- Naming:
+    • C++ classes:       `UMyManager`, `AMyActor`, `FMyStruct`
+    • Blueprint assets:  `BP_PairingManager`, `WBP_CodeWidget`,
+                          `M_HUDStatus`, `T_LogoAtlas`
+- UMG widgets that exist in 3D space MUST be World-Space and use
+  signed-distance-field fonts for legibility at HMD resolution.
+- Networking & async work:
+    • Use `FHttpModule` only for non-realtime REST calls.
+    • Use a dedicated Socket.IO C++ plugin (e.g., SocketIOClient) for
+      the command channel. Wrap it in a single `USignalingSubsystem`
+      (UGameInstanceSubsystem) so the rest of the codebase only
+      depends on a clean Blueprint-callable API.
+    • Use a dedicated Agora UE plugin for video/audio.
+- Performance:
+    • SceneCaptureComponent2D MUST render at 1280×720 only, capture
+      on a fixed 30 Hz schedule (NOT every tick), and write to a
+      dedicated RenderTarget that is reused (never reallocated per
+      frame).
+    • Disable bCaptureEveryFrame; drive captures from a timer.
+    • Avoid dynamic material instance creation on hot paths.
+    • No `Tick` on actors that don't need it — set
+      `PrimaryActorTick.bCanEverTick = false` by default.
+
+## 4.3 Web Back-End (Node.js / Express / Socket.IO)
+- ES2022+, `"type": "module"` in `package.json`, use `import`/`export`.
+- Keep `server.js` thin; factor handlers into `/Web_Dashboard/src/`:
+    • `pairing.js`   — room creation, code registry, lookup
+    • `commands.js`  — command relay + schema validation
+    • `agora.js`     — token minting (server-side, never client-side)
+- Validate every incoming Socket.IO payload against the §5 schema
+  before relaying. Reject unknown commands with a typed error event.
+- Use environment variables via `process.env` (load with `dotenv`
+  in development only).
+
+### 4.3.1 Agora Account Topology — v1 Decision
+- **Topology: Option A — single shared Agora project.** ONE Agora
+  App ID and App Certificate are used for all tenants/customers.
+- Credentials live ONLY on the server, in env vars:
+      AGORA_APP_ID            (safe to expose in tokens, never hard-coded)
+      AGORA_APP_CERTIFICATE   (server-side secret, NEVER sent to clients)
+- Tenant isolation is achieved by **channel naming convention**, not
+  by separate Agora projects. Canonical channel name format:
+      `t-<tenantId>-<pairingCode>`
+  This keeps a future migration to one-project-per-tenant trivial.
+- The token-minting function MUST take `tenantId` as a parameter
+  even though, in v1, every tenant resolves to the same App ID /
+  Certificate. Do not read the credentials inline at the call site;
+  go through a `getAgoraCredentials(tenantId)` lookup so swapping
+  to per-tenant credentials later is a one-file change.
+- Tokens are **short-lived (30–60 min)** and refreshed by the client
+  SDK mid-session. Do not mint long-lived tokens.
+- Every token issuance writes a usage row
+  (`tenantId, seatId, channel, role, issuedAt, expiresAt`) for
+  later billing/subscription reconciliation — even if v1 has no
+  active subscription gating yet.
+
+## 4.4 Web Front-End (Vanilla JS / HTML5 / CSS)
+- **Vanilla JS only** — no React/Vue/Svelte/jQuery unless explicitly
+  requested. Use native ES modules (`<script type="module">`).
+- HTML5 semantic elements (`<main>`, `<section>`, `<aside>`, etc.).
+- CSS uses **CSS Custom Properties (variables)** for theming. Define
+  the design tokens in a single `:root { … }` block in
+  `public/css/tokens.css`.
+- Aim for a modern, clean aesthetic: generous spacing, sans-serif
+  system font stack, soft shadows, rounded corners, high contrast.
+- No build step required for v1 — code must run as plain static
+  assets served by Express.
+
+## 4.5 Terminal Commands
+- Before providing any terminal command in chat output, **explicitly
+  state the target directory** the command must be run from. Example:
+
+      # From /Web_Dashboard/
+      npm install socket.io express
+
+
+# 5. COMMUNICATION CONTRACTS
+# ----------------------------------------------------------------------------
+
+## 5.1 Pairing (Socket.IO events)
+- `headset:register`     payload: `{ "code": "1234" }`
+                         emitted by: VR client on launch / reconnect
+- `instructor:join`      payload: `{ "code": "1234" }`
+                         emitted by: web dashboard on submit
+- `session:status`       payload: `{ "state": "waiting" | "connected" | "reconnecting" }`
+                         emitted by: server → both peers
+- `session:end`          payload: `{ "reason": "string" }`
+
+## 5.2 Canonical Command Payloads (Instructor → Headset)
+All commands are JSON objects with at minimum a `command` field. The
+following four MUST be supported exactly as specified:
+
+  • Pause / Resume Simulation
+        { "command": "pause_simulation", "value": true | false }
+
+  • Environment Changer
+        { "command": "change_environment", "map_name": "string" }
+
+  • Training Intervention (trigger event)
+        { "command": "trigger_event", "event_type": "string" }
+
+  • User Reset
+        { "command": "reset_user_position" }
+
+Rules:
+- Field names are `snake_case` in JSON (consistent with the spec).
+- Unknown commands MUST be ignored by the headset and logged by the
+  server. Never crash on a malformed payload.
+- Extensions are allowed but must be additive and documented in
+  `/Web_Dashboard/docs/commands.md` (create if missing).
+
+
+# 6. PERFORMANCE & QUALITY BARS
+# ----------------------------------------------------------------------------
+- VR frame time budget: **≤ 13.8 ms** (72 Hz) — hard ceiling.
+- Video capture cost: target ≤ 2.0 ms GPU per captured frame at 720p.
+- Command end-to-end latency target: **≤ 150 ms** instructor click →
+  headset event dispatch on a healthy LAN.
+- Video glass-to-glass latency target: **≤ 400 ms** via Agora.
+- Reconnect time after Wi-Fi blip target: **≤ 5 s** to "connected".
+- Dashboard first paint: **≤ 1 s** on a modern desktop browser.
+
+
+# 7. ANTI-PATTERNS — DO NOT DO
+# ----------------------------------------------------------------------------
+- ❌ Do not raise stream resolution or framerate above 720p/30fps.
+- ❌ Do not drive SceneCapture from Tick or capture every frame.
+- ❌ Do not put Agora App IDs, tokens, or any secret in client code.
+- ❌ Do not introduce a front-end framework (React/Vue/etc.) without
+     explicit instruction.
+- ❌ Do not require the instructor to re-enter the code after a
+     headset Wi-Fi blip — reconnect is the headset's responsibility.
+- ❌ Do not bypass the §5.2 JSON schema with ad-hoc message shapes.
+- ❌ Do not edit or commit UE engine-generated folders
+     (Binaries/, Saved/, Intermediate/, DerivedDataCache/, Build/).
+- ❌ Do not commit large binary assets without confirming they match
+     a Git LFS pattern in `.gitattributes`.
+- ❌ Do not assume an internet-facing deployment without asking —
+     v1 may run on a LAN.
+
+
+# 8. BUILD & DEPLOYMENT PIPELINE (UE VR CLIENT)
+# ----------------------------------------------------------------------------
+# This is the verified-working build and deployment loop for the standalone
+# mobile VR client. When the user asks to "build", "package", "deploy", or
+# "make a new build", execute this pipeline exactly. Do not improvise flags
+# or paths without explicit instruction.
+
+## 8.1 Headset Deployment Pre-requisites (verify before invoking the pipeline)
+1. Meta Quest 3 or Pico 4 Enterprise is connected to the PC via a USB-C
+   **data** cable (charge-only cables will not enumerate).
+2. Developer Mode is toggled ON in the device's mobile companion app
+   (Meta Quest app / PICO Business app).
+3. USB Debugging is authorized on the headset screen — choose
+   "Always allow from this computer".
+4. `adb devices` lists the headset serial with status **`device`**
+   (not `unauthorized`, not `offline`, not missing).
+
+If any of the four conditions fails, **stop and report** — do not attempt
+the build, because `-deploy -run` will fail late and waste a full cook.
+
+## 8.2 The Canonical UAT Command (verbatim — do not modify)
+
+Run from the `/VR_Project/` directory in a **Windows Command Prompt**
+(not PowerShell — `%CD%` expansion differs). If invoked from PowerShell,
+wrap with `cmd /c "<command>"` to preserve `%CD%` semantics.
+
+    "C:\Program Files\Epic Games\UE_5.5\Engine\Build\BatchFiles\RunUAT.bat" ^
+      BuildCookRun ^
+      -project="%CD%\VR_Project.uproject" ^
+      -targetplatform=Android ^
+      -cookflavor=ASTC ^
+      -clientconfig=Development ^
+      -build -cook -stage -package -archive ^
+      -archivedirectory="%CD%\Build" ^
+      -deploy -run
+
+## 8.3 Flag Reference
+- `-build`     : Generates editor targets and compiles native runtime modules.
+- `-cook`      : Bakes project assets into mobile-optimized formats (ASTC).
+- `-stage`     : Lays out cooked content into a deployable directory tree.
+- `-package`   : Bundles staged content + binaries into the Android APK.
+- `-archive`   : Copies the final artifacts to `-archivedirectory`.
+- `-deploy`    : Installs the APK on the connected headset over ADB.
+- `-run`       : Launches the app on the headset after install.
+
+## 8.4 Variants (only use when explicitly requested)
+- **Package only, no device push** — drop `-deploy -run`. Useful when no
+  headset is connected or when producing a build for sideload elsewhere.
+- **Shipping config** — replace `-clientconfig=Development` with
+  `-clientconfig=Shipping` for release builds. Expect longer compile and
+  smaller APK with no debug symbols. Do not use for daily iteration.
+- **Clean build** — prepend a manual delete of
+  `VR_Project\Binaries\`, `VR_Project\Intermediate\`,
+  `VR_Project\Saved\StagedBuilds\`, and `VR_Project\Build\` only when
+  the user explicitly asks for a clean rebuild. Never delete
+  `DerivedDataCache/` automatically (very expensive to repopulate).
+
+## 8.5 Known Failure Signatures → Resolutions
+Reference the Devlog `System Remediation History` section for full
+context. Short triage table:
+
+| Failure signature                                          | Likely cause                                | Resolution location |
+|------------------------------------------------------------|---------------------------------------------|---------------------|
+| `java.lang.NoClassDefFoundError: javax/xml/bind/...XmlSchema` | `cmdline-tools\latest\` symlink missing  | Devlog §3           |
+| `ExitCode=51 (Error_FailureGettingPackageInfo)`            | Missing `PackageName` or `-package` flag    | Devlog §4           |
+| `JAVA_HOME` points to `\jre\`                              | Legacy Android Studio variable layout       | Devlog §2           |
+| `NDK_ROOT` / `NDKROOT` pointing to old NDK                 | Stale env vars from legacy install          | Devlog §2           |
+| `adb devices` shows headset as `unauthorized`              | USB debug dialog not accepted on headset    | §8.1                |
+
+## 8.6 Output Artifacts
+On success, the deployable APK and its companion files land in:
+
+    /VR_Project/Build/Android_ASTC/
+
+The headset will already have the APK installed and the template map
+running. Confirm by tailing the last lines of the UAT log for
+`BUILD SUCCESSFUL` and `Deploy Time: ...` markers.
+
+
+# ============================================================================
+#  End of .cursorrules
+# ============================================================================
