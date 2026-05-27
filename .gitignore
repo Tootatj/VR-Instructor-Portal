@@ -1,0 +1,20 @@
+# Unreal Engine Specific
+Binaries/
+DerivedDataCache/
+Intermediate/
+Saved/
+Build/
+
+# Ignore Visual Studio / IDE files
+*.sln
+*.suo
+*.opensdf
+*.sdf
+*.VC.db
+*.VC.opendb
+.vs/
+.idea/
+
+# OS generated files
+.DS_Store
+Thumbs.db
