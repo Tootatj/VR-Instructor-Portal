@@ -2,9 +2,9 @@
 
 ## Current Project Status
 
-**Phase:** Capture pipeline groundwork — Agora streaming path (Phase 1 in progress)
+**Phase:** Agora streaming integration — Phase 2 in progress (plugin installed, BP join flow being wired)
 
-Build & deployment pipeline is fully validated end-to-end on Quest 3. Project is currently pure Blueprint + OpenXR (no user-authored C++). Last verified APK on device: commit `f7011de`, deployed 2026-05-28, total wall-clock ~85 seconds with warm `DerivedDataCache/`.
+Build & deployment pipeline is fully validated end-to-end on Quest 3. Project is currently pure Blueprint + OpenXR + the Agora UE plugin (no user-authored C++). Phase 1 (SceneCapture → RT → debug material) is complete; the RT samples correctly on the in-level debug plane in non-VR PIE, VR Preview, and on-headset.
 
 This developer log tracks completed environment engineering, architectural constraints, resolved pipeline blockers, and current session work for the **VR Instructor Portal** project.
 
@@ -151,16 +151,55 @@ A separate `SceneCaptureComponent2D` actor (built-in UE component) renders at ex
 - **1.5** Drop a `Plane` actor in `VRTemplateMap` sampling the RT via `M_RTStreamDebug`
 - **1.6** Verify in non-VR PIE → VR Preview → Quest deploy
 
-**Phase 2+ (deferred to next sessions):**
+### 2026-05-28 — Phase 2: Agora plugin install + BP join flow (in progress)
 
-- Agora developer account signup and project creation (no account yet)
-- Agora UE plugin selection (UE 5.5 + Android Quest compatibility critical — official vs. community wrapper to be evaluated)
-- `JoinChannel` connectivity sanity check (mic only, no custom video source yet)
-- Custom video frame push (RT → Agora `PushExternalVideoFrame` equivalent, includes RGBA→YUV420 conversion)
-- Server-side token minting (`Web_Dashboard/agora.js` per `.cursorrules §4.3.1`)
+**Plugin selection.** After surveying the Unreal+Agora ecosystem, settled on **`AgoraIO-Extensions/Agora-Unreal-RTC-SDK`** (official, actively maintained). Picked the **v4.5.0** release rather than v4.5.1 because 4.5.0 is the most recent release with explicit UE 5.3/5.4 validation in the upstream release notes — closer to our 5.5 target than the older 4.4.x line. UE 5.5 is not yet on the official compatibility matrix, but the plugin loaded and compiled cleanly on first open.
+
+**Why not a custom WebRTC build:** Agora's plugin ships pre-built Android `arm64-v8a` `.so` binaries, has a documented Blueprint API (`Get Agora Rtc Engine`, `Initialize`, `Enable Audio`, `Join Channel`, plus an `IRtcEngineEventHandler` UObject for event binds), and offloads all the codec/network plumbing we would otherwise own. It also has working precedent in shipping VR titles.
+
+**Install discipline.** The unpacked plugin is **814 MB** of pre-built SDK binaries. It is **not committed** — `.gitignore` now excludes `VR_Project/Plugins/AgoraPlugin/`. Each developer / CI runner installs it manually:
+
+1. Download `Agora_RTC_FULL_SDK_4.5.0_Unreal.zip` from <https://github.com/AgoraIO-Extensions/Agora-Unreal-RTC-SDK/releases/tag/v4.5.0>.
+2. Unzip and copy the inner `AgoraPlugin/` folder to `VR_Project/Plugins/AgoraPlugin/`.
+3. Open `VR_Project.uproject` — UE will compile the plugin on first launch (~1 min).
+4. Confirm enabled via `Edit → Plugins → AgoraPlugin` (should be on automatically if the folder is in place; also enable the built-in `AndroidPermission` plugin for the runtime mic/camera prompts).
+
+**Channel topology decision.** Using `CHANNEL_PROFILE_COMMUNICATION` rather than `LIVE_BROADCASTING` for the first sanity test. Communication mode is symmetric (every participant is implicitly a publisher), so no explicit `SetClientRole(Broadcaster)` call is needed for the initial round-trip audio test against Agora's web demo. If we later need true broadcast semantics (1-to-many audience), revisit and add the client-role node + per-side mode switches.
+
+**BP_VRPawn wiring — current state (compiles, not yet tested live).** The `BeginPlay` execution chain now ends with an Agora join sequence appended after the existing SceneCapture timer:
+
+```
+[existing] SetTimerByFunctionName(CaptureFrame, 0.0333s, looping)
+   ↓
+Request Android Permission (Permissions: String array; RECORD_AUDIO, MODIFY_AUDIO_SETTINGS,
+   INTERNET, ACCESS_NETWORK_STATE, READ_PHONE_STATE, CAMERA, WRITE_EXTERNAL_STORAGE)
+   ↓
+Delay (0.5s — lets the Android permission dialog resolve before SDK init)
+   ↓
+Initialize (Target = Get Agora Rtc Engine; Context = RtcEngineContext struct with App Id + ChannelProfile=COMMUNICATION)
+   ↓
+Enable Audio (Target = Get Agora Rtc Engine)
+   ↓
+Join Channel (Target = Get Agora Rtc Engine; Token, Channel Id, Info="", UID=0)
+```
+
+**Not yet wired.** Event handler binds. The plugin exposes existing event handlers via `Get Event Handler` (a pure node off the engine, with three output pins: `Handler Type`, `Event Handler`, `Event Handler Ex`). The middle `Event Handler` pin is the one to bind off. Pending event subscriptions before we can verify connection state:
+
+- `OnJoinChannelSuccess(Channel, Uid, Elapsed)` → print confirmation
+- `OnError(Err, Msg)` → red print for diagnostics
+- `OnUserJoined(Uid, Elapsed)` → confirm web-demo peer arrival
+- `OnLeaveChannel(Stats)` → confirm clean teardown
+
+**Credentials.** App ID and a 24-hour temporary token (for channel `test`) were generated in the Agora console and pasted directly into the `Make RtcEngineContext` and `Join Channel` nodes for the prototype. These are **prototype-only**; per `.cursorrules §4.1` and `§4.3.1`, production credentials live in server env vars and tokens are minted server-side and refreshed mid-session. Phase 4 (server-side `agora.js`) replaces these hard-coded values.
+
+**Next step:** wire the four event binds off `Get Event Handler`, then sanity-test in non-VR PIE against the Agora basic voice-call web demo (<https://webdemo.agora.io/basicVoiceCall/>) using the same App ID, channel `test`, and token. Once join + bidirectional audio confirmed on desktop, deploy to Quest and repeat. Custom video frame push (RT → Agora external video source) is Phase 3, after audio is proven.
 
 ### Open Backlog Items
 
-- Scaffold `Web_Dashboard/` (Node.js + Express + Socket.IO server skeleton, static SPA frontend) per `.cursorrules §3` and `§4.3`
-- OpenXR localization warnings in the Output Log (low priority cosmetic)
-- 10-bit swapchain fallback messages (low priority cosmetic)
+- **Phase 2 finalization:** bind `OnJoinChannelSuccess` / `OnError` / `OnUserJoined` / `OnLeaveChannel` off `Get Event Handler`, then PIE→web-demo sanity test.
+- **Phase 3:** push `RT_InstructorStream` as a custom Agora video source (BP if available, else minimal C++ wrapper for `IVideoFrameSource::onFrame`). Includes RGBA → YUV420 conversion at 1280×720 / 30 fps.
+- **Phase 4:** scaffold `Web_Dashboard/` (Node.js + Express + Socket.IO) per `.cursorrules §3` and `§4.3`, with `agora.js` token minter per `§4.3.1` (single shared App ID / channel-naming-convention tenant isolation, 30–60 min token TTL, usage-row logging).
+- **Phase 5:** instructor SPA — 4-digit code gatekeep, two-column dashboard (stream view + control deck), JSON command dispatch per `§5.2`.
+- Move the prototype App ID / Token out of BP into a non-source-controlled config asset once Phase 4 lands.
+- OpenXR localization warnings in the Output Log (low priority cosmetic).
+- 10-bit swapchain fallback messages (low priority cosmetic).
