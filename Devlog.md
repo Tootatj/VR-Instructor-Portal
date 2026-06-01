@@ -2,9 +2,9 @@
 
 ## Current Project Status
 
-**Phase:** Agora streaming integration — Phase 2 in progress (plugin installed, BP join flow being wired)
+**Phase:** Agora streaming integration — Phase 2 in progress (plugin installed, BP join flow being wired). Project is now Blueprint + minimal C++ scaffolding (required by the Agora plugin's compile chain — see 2026-06-01 entry).
 
-Build & deployment pipeline is fully validated end-to-end on Quest 3. Project is currently pure Blueprint + OpenXR + the Agora UE plugin (no user-authored C++). Phase 1 (SceneCapture → RT → debug material) is complete; the RT samples correctly on the in-level debug plane in non-VR PIE, VR Preview, and on-headset.
+Build & deployment pipeline is fully validated end-to-end on Quest 3. Phase 1 (SceneCapture → RT → debug material) is complete; the RT samples correctly on the in-level debug plane in non-VR PIE, VR Preview, and on-headset.
 
 This developer log tracks completed environment engineering, architectural constraints, resolved pipeline blockers, and current session work for the **VR Instructor Portal** project.
 
@@ -193,6 +193,31 @@ Join Channel (Target = Get Agora Rtc Engine; Token, Channel Id, Info="", UID=0)
 **Credentials.** App ID and a 24-hour temporary token (for channel `test`) were generated in the Agora console and pasted directly into the `Make RtcEngineContext` and `Join Channel` nodes for the prototype. These are **prototype-only**; per `.cursorrules §4.1` and `§4.3.1`, production credentials live in server env vars and tokens are minted server-side and refreshed mid-session. Phase 4 (server-side `agora.js`) replaces these hard-coded values.
 
 **Next step:** wire the four event binds off `Get Event Handler`, then sanity-test in non-VR PIE against the Agora basic voice-call web demo (<https://webdemo.agora.io/basicVoiceCall/>) using the same App ID, channel `test`, and token. Once join + bidirectional audio confirmed on desktop, deploy to Quest and repeat. Custom video frame push (RT → Agora external video source) is Phase 3, after audio is proven.
+
+### 2026-06-01 — Re-introducing C++ module for Agora plugin compile chain
+
+The `AgoraIO-Extensions/Agora-Unreal-RTC-SDK` v4.5.0 plugin ships with C++ source files that UnrealBuildTool must compile from inside the project's build graph. A pure-Blueprint project has no build graph, so opening the project with `Plugins/AgoraPlugin/` in place silently skips the plugin compile and the Agora BP nodes never resolve. Re-introducing a minimal C++ module is the standard fix.
+
+**Workflow used:** opened the project *without* `Plugins/AgoraPlugin/` on disk → `Tools → New C++ Class` to scaffold the module (UE generated the `Source/` tree + a placeholder `MyClass`) → closed the editor → dropped the v4.5.0 `AgoraPlugin/` folder into `Plugins/` → reopened, allowing UE to compile both the project module and the plugin's C++ sources in one pass.
+
+**Scope of this change — explicitly NOT a return to the SceneColorCopy approach.** The 2026-05-28 rollback eliminated a *view-extension* C++ module that subscribed to `FSceneViewExtensionBase::SubscribeToPostProcessingPass` and broke instanced stereo (`vr.InstancedStereo=True`). This new module is empty by design: it exists solely so UBT will compile the Agora plugin and link its `arm64-v8a` `.so` and Win64 `.lib` binaries into the build. The eventual `UAgoraVideoPump` (Phase 3) will live here as a single self-contained `UActorComponent` that reads from `RT_InstructorStream` and pushes RGBA frames to `IMediaEngine::pushVideoFrame()` — no view extensions, no `AddCopyTexturePass`, no MID-sampling.
+
+**Files added (committed):**
+
+- `VR_Project/Source/VR_Project.Target.cs` — Game target, `BuildSettingsVersion.V5`, `ExtraModuleNames = { "VR_Project" }`.
+- `VR_Project/Source/VR_ProjectEditor.Target.cs` — Editor target, same settings.
+- `VR_Project/Source/VR_Project/VR_Project.Build.cs` — module dependencies: `Core`, `CoreUObject`, `Engine`, `InputCore`. The Agora plugin module name will be added to `PrivateDependencyModuleNames` when Phase 3 lands.
+- `VR_Project/Source/VR_Project/VR_Project.h` / `.cpp` — module entry point (`IMPLEMENT_PRIMARY_GAME_MODULE(FDefaultGameModuleImpl, VR_Project, "VR_Project")`).
+
+**Files removed before commit:**
+
+- `Source/VR_Project/MyClass.h` / `MyClass.cpp` — the UE wizard's default boilerplate used to trigger module scaffolding. Inherits from nothing, referenced nowhere; deleted to keep the module surface intentionally empty until Phase 3.
+
+**`.uproject` patch:** re-adds the `Modules` array with `{ Name: "VR_Project", Type: "Runtime", LoadingPhase: "Default" }`. This re-enables editor-side hot-reload of the project module and tells UBT that the `Source/VR_Project/` directory is a real module, not orphan files.
+
+**`.gitignore`:** `VR_Project/Plugins/AgoraPlugin/` remains gitignored (800 MB of vendor binaries — re-verified by `git check-ignore`). Install instructions unchanged from the 2026-05-28 entry.
+
+**Validation:** project opens, plugin compiles cleanly on first open (~1 min cold), no new warnings in the Output Log beyond the pre-existing OpenXR localization noise. Full UAT BuildCookRun → deploy to Quest 3 still works. No runtime behavior change — the Agora App ID and 24h temporary token are still hard-coded in the `Make RtcEngineContext` and `Join Channel` BP nodes; the four event-handler binds (`OnJoinChannelSuccess`, `OnError`, `OnUserJoined`, `OnLeaveChannel`) remain the next concrete unit of work before the Phase 2 audio round-trip can be tested.
 
 ### Open Backlog Items
 
