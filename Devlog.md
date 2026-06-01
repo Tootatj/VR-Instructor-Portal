@@ -2,9 +2,9 @@
 
 ## Current Project Status
 
-**Phase:** Agora streaming integration — Phase 2 complete on desktop PIE (bidirectional audio round-trip verified against `webdemo.agora.io/basicVoiceCall`). Project is now Blueprint + minimal C++ scaffolding (required by the Agora plugin's compile chain — see 2026-06-01 entry).
+**Phase:** Agora streaming integration — **Phase 2 fully complete (PIE + Quest 3)**. Bidirectional voice verified end-to-end: Quest mic → Agora → browser, browser mic → Agora → Quest speakers. The next concrete unit of work is Phase 3 (push `RT_InstructorStream` as an Agora custom video source).
 
-Build & deployment pipeline is fully validated end-to-end on Quest 3. Phase 1 (SceneCapture → RT → debug material) is complete and verified across non-VR PIE, VR Preview, and on-headset. Phase 2 (Agora audio join + event handlers + lifecycle) is complete on desktop PIE and pending on-headset verification. Pinned plugin version is **v4.5.1** (revised up from v4.5.0 after empirical UE 5.5.4 validation — see 2026-06-01 second entry).
+Build & deployment pipeline validated end-to-end on Quest 3. Phase 1 (SceneCapture → RT → debug material) and Phase 2 (Agora audio join + event handlers + lifecycle + on-device round-trip) are both complete. Project is Blueprint + minimal C++ scaffolding (required by the Agora plugin's compile chain — see 2026-06-01 first entry). Pinned plugin version is **v4.5.1** (revised up from v4.5.0 after empirical UE 5.5.4 validation).
 
 This developer log tracks completed environment engineering, architectural constraints, resolved pipeline blockers, and current session work for the **VR Instructor Portal** project.
 
@@ -266,9 +266,39 @@ Decision: pin v4.5.1 going forward (`README.md` + `VR_Project/Plugins/README.md`
 
 **Next concrete step:** deploy the same APK to Quest 3 with the canonical UAT command (`.cursorrules §8.2`), bump the BeginPlay `Delay` from 0.1s → 0.5s first (Android permission dialog needs settle time on cold first launch), then repeat the round-trip on-headset. After Quest verification, Phase 2 is fully complete and Phase 3 (video pump) begins.
 
+### 2026-06-01 — Phase 2 on-headset verification complete
+
+Deployed the Phase 2 BP via the canonical UAT command (`.cursorrules §8.2`) to the connected Quest 3. Full pipeline timing: BuildCookRun `~57 minutes total` (first cold build with the new C++ module — UBT compiled the project module + 24 Agora extension `.so` files for `arm64-v8a` from scratch). Subsequent warm rebuilds are expected at the previously-recorded `~85 s` baseline once DDC is populated.
+
+**One auto-recovered deploy hiccup:** first `adb install -r` failed with `INSTALL_FAILED_UPDATE_INCOMPATIBLE: Existing package com.Thomas.VRProject signatures do not match newer version`. The previous on-device APK was signed with a different debug certificate than the one the current build chain produced (likely a different machine or a wiped keystore in the interim). UAT auto-retried with a clean `adb install` (no `-r`), which uninstalls first and reinstalls fresh — succeeded immediately. Worth knowing this is automatic and harmless; no manual `adb uninstall` step is required.
+
+**On-headset test results:**
+
+1. **First cold launch after install — partial failure (mic publish silent):**
+   - Quest displayed Android RECORD_AUDIO permission dialog.
+   - BP `Delay` was set to **`0.1 s`** (not the 0.5s recommendation), so `Initialize` fired before the user had even seen the dialog, let alone tapped Allow.
+   - Network-level join succeeded: green `Joined channel=Test01 uid=<n>` printed (visible via in-game `Print to Screen`).
+   - But the SDK's mic capture path silently failed because RECORD_AUDIO was not yet granted when `EnableAudio` attempted to open the device.
+   - Symptom: phone browser (peer) could not hear the Quest, even though the Quest was in the channel.
+
+2. **Close-and-relaunch from app library — full success:**
+   - Killed the running app via the Quest's universal menu, relaunched from app library (no reinstall — preserved the now-granted permission state).
+   - Android skipped the permission dialog (already granted from step 1).
+   - Mic was available the instant the SDK initialized; the 0.1s delay no longer mattered.
+   - **Bidirectional audio confirmed:** Quest mic audible on phone browser, phone mic audible through Quest speakers, no artifacts, no perceptible latency issues (subjective — not yet measured against the §6 budget of ≤ 400 ms glass-to-glass).
+
+**Permanent fix queued in backlog:** bump BP `Delay` from `0.1 s` to `0.5 s` (or `1.0 s` for cushion against permission-dialog render latency on fresh installs). This eliminates the cold-launch race so the first-launch-after-install also publishes audio without requiring the close-and-relaunch workaround. Not blocking for development iteration (any further deploys reuse the granted permission), but mandatory before any production release or any CI install scenario.
+
+**Build environment notes from this run (both harmless):**
+
+- `Visual Studio 2022 compiler version 14.44.35222 is not a preferred version. Please use the latest preferred version 14.38.33130` — UE 5.5 prefers MSVC 14.38, the dev machine has 14.44. Build succeeded anyway. If we ever care about silencing this, install the 14.38 toolset via VS Installer (Modify → Individual components → "MSVC v143 - VS 2022 C++ x64/x86 build tools (14.38)"). Not currently worth the time.
+- `UnrealTrace: Failed to start server; ExitCode=12293` — Unreal Insights trace server collision (another instance already running). Doesn't affect build or runtime. Ignore.
+
+**Phase 2 is now closed.** All four event handler binds fire as expected on real hardware, the lifecycle (join / publish / subscribe / leave / release) is clean, and the credentials we baked into the BP (App ID + per-channel `Test01` token) are validated. Phase 3 begins next: push `RT_InstructorStream` as an Agora custom video source so the instructor sees the trainee POV.
+
 ### Open Backlog Items
 
-- **Phase 2 on-headset verification:** bump BeginPlay Delay 0.1s → 0.5s, deploy to Quest, round-trip audio against `webdemo.agora.io/basicVoiceCall`. Note any Android-specific permission flow issues.
+- **BP polish (do before any fresh install scenario):** bump BeginPlay `Delay` 0.1s → 0.5s (or 1.0s) to eliminate the cold-launch permission race documented in the 2026-06-01 on-headset entry.
 - **Phase 3:** push `RT_InstructorStream` as a custom Agora video source. Confirm the plugin's BP surface for `SetExternalVideoSource` / `PushVideoFrame` (likely needs Phase 3 to live in the `VR_Project` C++ module as a `UAgoraVideoPump` `UActorComponent` calling `IMediaEngine::pushVideoFrame()` directly). Includes RGBA → YUV420 conversion at 1280×720 / 30 fps.
 - **Phase 4:** scaffold `Web_Dashboard/` (Node.js + Express + Socket.IO) per `.cursorrules §3` and `§4.3`, with `agora.js` token minter per `§4.3.1` (single shared App ID / channel-naming-convention tenant isolation, 30–60 min token TTL, usage-row logging, **per-channel token binding — never reuse across channel names**).
 - **Phase 5:** instructor SPA — 4-digit code gatekeep, two-column dashboard (stream view + control deck), JSON command dispatch per `§5.2`.
