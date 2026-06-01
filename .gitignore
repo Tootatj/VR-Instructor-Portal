@@ -20,7 +20,8 @@ Build/
 
 # Third-party Unreal plugins distributed as pre-built SDKs (not source-controlled;
 # each dev/CI must drop them into VR_Project/Plugins/ from the upstream release).
-# See Devlog "Agora plugin install" entry for the canonical install instructions.
+# See README.md "Setup -> step 2" and the Devlog 2026-05-28 "Phase 2: Plugin
+# install discipline" entry for the canonical install instructions.
 VR_Project/Plugins/AgoraPlugin/
 
 # OS generated files
