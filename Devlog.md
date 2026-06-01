@@ -2,9 +2,9 @@
 
 ## Current Project Status
 
-**Phase:** Agora streaming integration — Phase 2 in progress (plugin installed, BP join flow being wired). Project is now Blueprint + minimal C++ scaffolding (required by the Agora plugin's compile chain — see 2026-06-01 entry).
+**Phase:** Agora streaming integration — Phase 2 complete on desktop PIE (bidirectional audio round-trip verified against `webdemo.agora.io/basicVoiceCall`). Project is now Blueprint + minimal C++ scaffolding (required by the Agora plugin's compile chain — see 2026-06-01 entry).
 
-Build & deployment pipeline is fully validated end-to-end on Quest 3. Phase 1 (SceneCapture → RT → debug material) is complete; the RT samples correctly on the in-level debug plane in non-VR PIE, VR Preview, and on-headset.
+Build & deployment pipeline is fully validated end-to-end on Quest 3. Phase 1 (SceneCapture → RT → debug material) is complete and verified across non-VR PIE, VR Preview, and on-headset. Phase 2 (Agora audio join + event handlers + lifecycle) is complete on desktop PIE and pending on-headset verification. Pinned plugin version is **v4.5.1** (revised up from v4.5.0 after empirical UE 5.5.4 validation — see 2026-06-01 second entry).
 
 This developer log tracks completed environment engineering, architectural constraints, resolved pipeline blockers, and current session work for the **VR Instructor Portal** project.
 
@@ -219,12 +219,61 @@ The `AgoraIO-Extensions/Agora-Unreal-RTC-SDK` v4.5.0 plugin ships with C++ sourc
 
 **Validation:** project opens, plugin compiles cleanly on first open (~1 min cold), no new warnings in the Output Log beyond the pre-existing OpenXR localization noise. Full UAT BuildCookRun → deploy to Quest 3 still works. No runtime behavior change — the Agora App ID and 24h temporary token are still hard-coded in the `Make RtcEngineContext` and `Join Channel` BP nodes; the four event-handler binds (`OnJoinChannelSuccess`, `OnError`, `OnUserJoined`, `OnLeaveChannel`) remain the next concrete unit of work before the Phase 2 audio round-trip can be tested.
 
+### 2026-06-01 — Phase 2 desktop completion + v4.5.1 confirmation
+
+PIE↔web-demo audio round-trip is working. Channel name standardized as `Test01` (case-sensitive); the temp token is regenerated in the Agora console and bound to this exact channel name. The four event handler binds (`OnJoinChannelSuccess`, `OnError`, `OnUserJoined`, `OnLeaveChannel`) all fire and print to the Output Log via `LogBlueprintUserMessages`.
+
+**Final BeginPlay chain in `VRPawn.uasset`:**
+
+```
+SetTimerByFunctionName(CaptureFrame, 0.0333s, looping)
+  -> Request Android Permission (RECORD_AUDIO, MODIFY_AUDIO_SETTINGS, INTERNET,
+       ACCESS_NETWORK_STATE, READ_PHONE_STATE, CAMERA, WRITE_EXTERNAL_STORAGE)
+  -> Delay 0.1s   (NOTE: bump to >= 0.5s before Quest deploy — see backlog)
+  -> Initialize (Get Agora Rtc Engine, Context = { eventHandlerType=EventHandler,
+       appId=<…>, channelProfile=COMMUNICATION, audioScenario=DEFAULT,
+       areaCode=GLOBAL, autoRegisterAgoraExtensions=true })
+  -> Bind Event to OnJoinChannelSuccess -> Custom Event OnAgoraJoined -> Print
+  -> Bind Event to OnError              -> Custom Event OnAgoraError  -> Print
+  -> Bind Event to OnUserJoined         -> Custom Event OnAgoraPeerJoined -> Print
+  -> Bind Event to OnLeaveChannel       -> Custom Event OnAgoraLeft   -> Print
+  -> Enable Audio
+  -> Join Channel (Token=<…>, ChannelId="Test01", Uid=0)
+```
+
+**Lifecycle (`EndPlay`):**
+
+```
+Event EndPlay -> Leave Channel -> Release (Sync=true)
+```
+
+The lifecycle chain is non-optional. Without it, the second PIE play after a stop crashes with `EXCEPTION_ACCESS_VIOLATION` deep in `agora_rtc_sdk` / `libaosl` — the SDK is a true singleton (per its own API docs: *"only one IRtcEngine instance is supported per app"*) and re-`Initialize` on a half-cleaned-up instance dereferences a null. `Sync=true` blocks the game thread ~50–200 ms during teardown but guarantees full resource release before PIE reaps the BP context.
+
+**One crash diagnosed mid-session:** first `Join Channel` attempted with a token minted for a different channel name than what was passed to the BP node. The SDK didn't return `-110 ERR_INVALID_TOKEN` cleanly — it crashed in native code with the same access-violation signature. Fix was to regenerate the temp token in the Agora console specifically bound to `Test01`. **Lesson for Phase 4:** server-side token minter must always mint per-channel; never reuse a token across channel names even within the same App ID.
+
+**Plugin version revision: v4.5.0 → v4.5.1.** The 2026-05-28 entry pinned v4.5.0 for its explicit UE 5.3/5.4 validation in the upstream release notes. The user actually installed v4.5.1 (downloaded from `/releases` rather than the specific tag link). v4.5.1 startup log:
+
+```
+LogAgora: Display: FAgoraPluginModule - StartupModule:
+  Agora SDK Version: 4.5.1 Build: 591539  UnrealVersion: UE 5.5.4
+```
+
+It initialized, joined, published audio, received remote audio, left, released, and re-initialized cleanly across multiple PIE iterations. The five `LogClass: Error: ... is not initialized properly` warnings on startup (`FUABT_CodecCapLevels`, `FUABT_MixedAudioStream`, `FUABT_LocalAudioMixerConfiguration`) are pre-existing reflection bugs in the plugin source with no runtime impact. The Python warning about `OnAudioDeviceStateChanged` name collision with UE's built-in AudioMixer module is also cosmetic.
+
+Decision: pin v4.5.1 going forward (`README.md` + `VR_Project/Plugins/README.md` updated to match). The v4.5.0 references in the 2026-05-28 entry stay as the historical record of what was decided at that time.
+
+**Validation:** stop-and-restart PIE 5x in a row, no crash, fresh `Initialize 0` → `Joined channel=Test01 uid=<n>` → `LEFT channel` each iteration. Browser side correctly sees the trainee join and leave each cycle.
+
+**Next concrete step:** deploy the same APK to Quest 3 with the canonical UAT command (`.cursorrules §8.2`), bump the BeginPlay `Delay` from 0.1s → 0.5s first (Android permission dialog needs settle time on cold first launch), then repeat the round-trip on-headset. After Quest verification, Phase 2 is fully complete and Phase 3 (video pump) begins.
+
 ### Open Backlog Items
 
-- **Phase 2 finalization:** bind `OnJoinChannelSuccess` / `OnError` / `OnUserJoined` / `OnLeaveChannel` off `Get Event Handler`, then PIE→web-demo sanity test.
-- **Phase 3:** push `RT_InstructorStream` as a custom Agora video source (BP if available, else minimal C++ wrapper for `IVideoFrameSource::onFrame`). Includes RGBA → YUV420 conversion at 1280×720 / 30 fps.
-- **Phase 4:** scaffold `Web_Dashboard/` (Node.js + Express + Socket.IO) per `.cursorrules §3` and `§4.3`, with `agora.js` token minter per `§4.3.1` (single shared App ID / channel-naming-convention tenant isolation, 30–60 min token TTL, usage-row logging).
+- **Phase 2 on-headset verification:** bump BeginPlay Delay 0.1s → 0.5s, deploy to Quest, round-trip audio against `webdemo.agora.io/basicVoiceCall`. Note any Android-specific permission flow issues.
+- **Phase 3:** push `RT_InstructorStream` as a custom Agora video source. Confirm the plugin's BP surface for `SetExternalVideoSource` / `PushVideoFrame` (likely needs Phase 3 to live in the `VR_Project` C++ module as a `UAgoraVideoPump` `UActorComponent` calling `IMediaEngine::pushVideoFrame()` directly). Includes RGBA → YUV420 conversion at 1280×720 / 30 fps.
+- **Phase 4:** scaffold `Web_Dashboard/` (Node.js + Express + Socket.IO) per `.cursorrules §3` and `§4.3`, with `agora.js` token minter per `§4.3.1` (single shared App ID / channel-naming-convention tenant isolation, 30–60 min token TTL, usage-row logging, **per-channel token binding — never reuse across channel names**).
 - **Phase 5:** instructor SPA — 4-digit code gatekeep, two-column dashboard (stream view + control deck), JSON command dispatch per `§5.2`.
 - Move the prototype App ID / Token out of BP into a non-source-controlled config asset once Phase 4 lands.
+- Rename `VRPawn` → `BP_VRPawn` to match `.cursorrules §4.2` naming convention (cosmetic refactor; not urgent).
+- Re-color the four Phase 2 Print Strings (currently all yellow) — green/red/cyan/yellow for join/error/peer-join/leave readability.
 - OpenXR localization warnings in the Output Log (low priority cosmetic).
 - 10-bit swapchain fallback messages (low priority cosmetic).

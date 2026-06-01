@@ -44,8 +44,8 @@ The **Agora-Unreal-RTC-SDK** plugin is **not committed** to this repository
 (~800 MB of vendor-distributed prebuilt SDK binaries). Every developer and
 CI runner must install it manually before opening the project:
 
-1. Download **`Agora_RTC_FULL_SDK_4.5.0_Unreal.zip`** from the upstream v4.5.0 release:
-   <https://github.com/AgoraIO-Extensions/Agora-Unreal-RTC-SDK/releases/tag/v4.5.0>
+1. Download **`Agora_RTC_FULL_SDK_4.5.1_Unreal.zip`** from the upstream v4.5.1 release:
+   <https://github.com/AgoraIO-Extensions/Agora-Unreal-RTC-SDK/releases/tag/v4.5.1>
 2. Unzip the archive.
 3. Copy the inner `AgoraPlugin/` folder into `VR_Project/Plugins/` so the
    final path is exactly:
@@ -57,9 +57,12 @@ CI runner must install it manually before opening the project:
 4. The plugin folder is listed in `.gitignore` — confirm with `git status`
    that it does **not** appear as untracked.
 
-> **Use v4.5.0 specifically.** Newer 4.5.x releases have not been validated
-> against UE 5.5 in this project. See the `Devlog.md` "2026-05-28 — Phase 2"
-> entry for the rationale.
+> **Use v4.5.1 specifically.** This is the version empirically verified
+> against UE 5.5.4 in this project (PIE↔web-demo audio round-trip working,
+> multiple play/stop cycles without crash). See the `Devlog.md` 2026-06-01
+> "Phase 2 desktop completion + v4.5.1 confirmation" entry for the validation
+> log. Do not silently bump to newer 4.5.x releases without re-running the
+> Phase 2 PIE round-trip first.
 
 > **Upstream repo:** <https://github.com/AgoraIO-Extensions/Agora-Unreal-RTC-SDK>
 
