@@ -736,7 +736,11 @@ a.btn { text-decoration: none; display: inline-flex; align-items: center; }
   .form__row { grid-template-columns: 1fr; }
 }
 
-/* Inline checkbox + descriptive label (stub-mode toggle on the faker) */
+/* Inline checkbox + descriptive label (stub-mode toggle on the faker).
+   The .field input rule above gives every input width: 100% + padding +
+   colored background, which turns this checkbox into a full-width form
+   field and squashes the description span next to it. Reset all of that
+   here. */
 .field--inline {
   flex-direction: row;
   align-items: flex-start;
@@ -749,8 +753,20 @@ a.btn { text-decoration: none; display: inline-flex; align-items: center; }
   color: var(--color-text-muted);
 }
 .field--inline input[type="checkbox"] {
-  margin-top: 3px;
+  width: auto;
+  padding: 0;
+  background: none;
+  border: none;
+  border-radius: 0;
+  margin: 3px 0 0 0;
   flex-shrink: 0;
+  accent-color: var(--color-accent);
+  cursor: pointer;
+}
+.field--inline span {
+  flex: 1 1 auto;
+  min-width: 0;
+  line-height: 1.4;
 }
 .field--inline strong {
   color: var(--color-text);

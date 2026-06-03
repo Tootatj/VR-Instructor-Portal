@@ -465,9 +465,32 @@ Backed up the previous single-session SPA as `/single.html` (loads `js/single.js
 
 **Net state.** The OneBonsai grid view is fully testable today with the faker. With per-device BP edits + stub-mode bridges, both real headsets join the grid as additional LIVE tiles. Phase 5 BP command handlers + full Socket.IO subsystem remain on the backlog as the architecturally-clean follow-up.
 
+### 2026-06-03 — Phase 4.5 Quest verification (PASSED) + faker CSS layout fix
+
+Real Quest 3 successfully joined the OneBonsai grid as a tile alongside web-fakers. End-to-end validation of the multi-session pipeline with a real VR app.
+
+**Recipe used (per the Phase 4.5 entry's stub-mode bridge plan).**
+
+1. **Agora console:** generated a 24 h temp token bound to channel `t-onebonsai-1111` (channel name follows the canonical `t-<tenantId>-<pairingCode>` convention so the server's `/api/token` mints with the same string when the dashboard later subscribes).
+2. **`BP_VRPawn` edits:** in the `Join Channel` node at the tail of BeginPlay — `ChannelId` literal `Test01` → `t-onebonsai-1111`, `Token` literal replaced with the fresh string. Compile + save.
+3. **Pre-deploy BP polish:** bumped the early `Delay` node `Duration` from `0.1` → `0.5` s (the previously-deferred fix from the 2026-06-01 on-headset permission-race entry — relevant because this was a fresh-install scenario with a renamed channel + token rather than an `adb install -r` update).
+4. **UAT BuildCookRun:** canonical `.cursorrules §8.2` command. Cold cook (Intermediate had been touched since the last Phase 3 verification build) — total wall time 8 m 49 s. APK packaged, archived to `Build/Android_ASTC/`, `adb install` succeeded, `adb shell am start` launched the app, UAT tailed logcat as designed.
+5. **Dashboard side:** opened `/faker.html`, ticked **Stub mode**, entered tenant `onebonsai` + code `1111` + scenario "Fire Training" + trainee "Demo — Quest 3", clicked Start. Faker registered via `headset:register` with `source: 'headset'` (the stub-mode override), the grid tile appeared immediately labeled correctly with the LIVE pill.
+6. **Headset wake-up:** within ~2-3 s of putting on the Quest, the tile's status flipped from "Waiting for video" → "Live" and started showing the trainee POV. End-to-end pipeline confirmed:
+   - Real headset publishing to Agora SD-RTN ✓
+   - Server's `/api/token` minting a subscriber token bound to the same `t-onebonsai-1111` channel ✓
+   - Grid's per-tile Agora client subscribing and rendering the video ✓
+   - Stub mode correctly providing only the session metadata while the Quest provides the video ✓
+   - 0.5 s `Delay` eliminated the cold-launch permission race (no `EXCEPTION_ACCESS_VIOLATION` in logcat, no muted audio symptom) ✓
+
+**UAT gotcha encountered + resolved.** First build attempt aborted in 7 s with `Unable to build while Live Coding is active. Exit the editor and game, or press Ctrl+Alt+F11 if iterating on code in the editor or game`. Cause: the UE editor was still open from the BP edits. Live Coding holds the build artifacts locked, blocking UAT from relinking. Resolution: closed the editor entirely — also freed ~6 GB of RAM and made the subsequent cook noticeably faster. Worth pinning to operational memory: **after any BP edit cycle, close the editor before invoking UAT.** Pressing Ctrl+Alt+F11 in the editor to toggle Live Coding off is the lighter alternative when the editor needs to stay open.
+
+**Faker page CSS layout fix.** The stub-mode checkbox row on `/faker.html` was visibly broken — the checkbox rendered as a full-width styled rectangle and the description text was squeezed into a narrow column on the right. Root cause: the `.field input, .field textarea { width: 100%; padding:...; background:...; border:...; }` rule from the form-element styling was matching the stub-mode checkbox (which lives inside a `.field--inline` label), turning it into a giant form-field-shaped block. Fix: added an explicit reset block scoped to `.field--inline input[type="checkbox"]` (`width: auto; padding: 0; background: none; border: none; border-radius: 0; accent-color: var(--color-accent)`) plus a `.field--inline span { flex: 1 1 auto; min-width: 0 }` so the description fills the remaining horizontal space. Verified by hard-refresh on the running faker page — checkbox renders as a normal small square, description text flows alongside.
+
+**Lesson (worth pinning).** Sub-modifier classes that change a parent's flex direction (`.field` column → `.field--inline` row) need to also defensively reset child-element styles the parent established for the previous direction. Putting a checkbox inside a label class designed for text inputs is a common pattern that needs explicit unstyling.
+
 ### Open Backlog Items
 
-- **BP polish (do before any fresh install scenario):** bump BeginPlay `Delay` 0.1s → 0.5s (or 1.0s) to eliminate the cold-launch permission race documented in the 2026-06-01 on-headset entry.
 - **Phase 4 — wire headset to server:** install a UE Socket.IO plugin per `.cursorrules §4.2`, scaffold a `USignalingSubsystem` (UGameInstanceSubsystem) that owns `headset:register` + token fetch + `headset:command` dispatch into the BP layer. Replace the BP's currently-hardcoded App ID + Token + channel literal with server-minted credentials + a runtime-chosen code (random-on-launch or from a device fingerprint). This is what makes stub mode unnecessary on the dashboard side.
 - **Phase 5 — BP `headset:command` consumer:** bind a command-receive event in `BP_VRPawn` that catches the four §5.2 commands and acts on them (global pause var for `pause_simulation`, `OpenLevel` for `change_environment`, custom event dispatch for `trigger_event`, teleport to start for `reset_user_position`). The faker's `formatCommand` switch is a reference implementation.
 - **Phase 5:** broader instructor-facing polish (auth, per-tenant branding, real session metadata from the headset rather than the stub).
