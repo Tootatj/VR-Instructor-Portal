@@ -1,0 +1,82 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>VR Instructor Portal — Live Session</title>
+  <link rel="stylesheet" href="./css/tokens.css">
+  <link rel="stylesheet" href="./css/style.css">
+</head>
+<body>
+  <header class="app-header">
+    <h1 class="app-header__title">VR Instructor Portal</h1>
+    <span class="app-header__subtitle">Step 1 — static receiver MVP</span>
+  </header>
+
+  <main class="dashboard">
+    <section class="stream-view" aria-labelledby="stream-title">
+      <h2 id="stream-title" class="visually-hidden">Trainee POV</h2>
+      <div id="remote-video" class="stream-view__video">
+        <div class="stream-view__placeholder">
+          <p class="stream-view__placeholder-title">Not connected</p>
+          <p class="stream-view__placeholder-hint">Fill in the panel on the right and join a channel to start receiving the trainee's POV.</p>
+        </div>
+      </div>
+      <div class="stream-view__status" aria-live="polite">
+        <span id="status-text" class="status status--idle">Idle</span>
+      </div>
+
+      <div id="audio-controls" class="audio-controls" hidden>
+        <button type="button" id="mic-toggle" class="toggle-btn" aria-pressed="false" data-muted="false">
+          <span class="toggle-btn__dot" aria-hidden="true"></span>
+          <span class="toggle-btn__label">Mic on</span>
+        </button>
+        <button type="button" id="speaker-toggle" class="toggle-btn" aria-pressed="false" data-muted="false">
+          <span class="toggle-btn__dot" aria-hidden="true"></span>
+          <span class="toggle-btn__label">Speaker on</span>
+        </button>
+        <label class="volume-control">
+          <span class="volume-control__label">Volume</span>
+          <input type="range" id="volume-slider" min="0" max="100" value="100">
+          <span class="volume-control__value" id="volume-value">100</span>
+        </label>
+      </div>
+    </section>
+
+    <aside class="control-deck" aria-labelledby="control-title">
+      <h2 id="control-title" class="control-deck__title">Connection</h2>
+
+      <form id="join-form" class="form" autocomplete="off">
+        <label class="field">
+          <span class="field__label">Agora App ID</span>
+          <input type="text" id="app-id" name="appId" required spellcheck="false">
+        </label>
+
+        <label class="field">
+          <span class="field__label">Channel name</span>
+          <input type="text" id="channel" name="channel" required spellcheck="false" placeholder="Test01">
+        </label>
+
+        <label class="field">
+          <span class="field__label">Token</span>
+          <textarea id="token" name="token" required rows="3" spellcheck="false"></textarea>
+        </label>
+
+        <div class="form__actions">
+          <button type="submit" id="join-btn" class="btn btn--primary">Join</button>
+          <button type="button" id="leave-btn" class="btn btn--secondary" disabled>Leave</button>
+        </div>
+      </form>
+
+      <div class="control-deck__hint">
+        <p><strong>Phase 5</strong> replaces this connection form with the live command deck (pause simulation, change environment, trigger event, reset user position).</p>
+      </div>
+    </aside>
+  </main>
+
+  <!-- Agora Web SDK — pinned via the CDN filename. Loaded as a classic script
+       so AgoraRTC is on window before main.js (a deferred ES module) runs. -->
+  <script src="https://download.agora.io/sdk/release/AgoraRTC_N-4.20.0.js"></script>
+  <script type="module" src="./js/main.js"></script>
+</body>
+</html>

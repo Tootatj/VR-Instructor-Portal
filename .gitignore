@@ -28,6 +28,10 @@ VR_Project/Plugins/AgoraPlugin/
 # hardcodes the dev's LAN trace-host IP). Generated locally during perf passes.
 VR_Project/Profiling/
 
+# Web Dashboard — Node deps + local secrets.
+Web_Dashboard/node_modules/
+Web_Dashboard/.env
+
 # OS generated files
 .DS_Store
 Thumbs.db

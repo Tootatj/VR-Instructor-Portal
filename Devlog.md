@@ -2,7 +2,7 @@
 
 ## Current Project Status
 
-**Phase:** Agora streaming integration — **Phase 3 fully polished in PIE.** Video stream verified end-to-end (Quest scene → `RT_InstructorStream` → `UAgoraVideoPump` → `pushVideoFrame` → Agora SD-RTN → web demo video pane shows correctly-exposed scene content). All three deferred polish items from 2026-06-01 are now resolved: frame-rate spikes (SceneCapture timer 10× over-capture corrected + readback moved to async), dark receiver exposure (RT format flipped to sRGB-encoded), and diagnostic logging stripped. The only remaining Phase 3 item is a fresh Quest verification of the polished build before declaring Phase 3 closed.
+**Phase:** Agora streaming integration — **Phase 3 closed; first piece of Phase 4 (Web_Dashboard) scaffolded.** End-to-end Quest 3 verification passed on Vulkan/arm64: correct sRGB exposure, stable 30 fps under head movement, bidirectional audio intact. The trainee POV streams cleanly into a self-hosted receiver page (no longer dependent on Agora's hosted demo URL). Bidirectional voice now works in both directions (Step 1.5 polish on the MVP added the instructor mic publish + mute/speaker/volume controls). The Phase 4 server (Express + Socket.IO + token minter + pairing + command relay) is scaffolded per `.cursorrules §3 / §4.3 / §4.3.1 / §5` but not yet wired into the SPA — that's the next discrete unit of work.
 
 Build & deployment pipeline validated end-to-end on Quest 3. Phase 1 (SceneCapture → RT → debug material) and Phase 2 (Agora audio join + event handlers + lifecycle + on-device round-trip) are both complete. Project is Blueprint + minimal C++ scaffolding (required by the Agora plugin's compile chain — see 2026-06-01 first entry). Pinned plugin version is **v4.5.1** (revised up from v4.5.0 after empirical UE 5.5.4 validation).
 
@@ -371,11 +371,45 @@ Fix: flipped `RT_InstructorStream` Render Target Format from `RTF_RGBA8` to **`R
 
 **Net state of Phase 3 after these three batches:** end-to-end stream is correctly exposed, runs at the spec'd 30 Hz, has no game-thread readback stall, and contains no leftover diagnostic noise. Pending: fresh Quest verification of the polished build (the 2026-06-01 in-flight build is obsolete — it pre-dates all three polish items).
 
+### 2026-06-03 — Phase 3 Quest verification (PASSED) + Web_Dashboard introduction
+
+**Quest verification of the polished build — passed on hardware.** Fresh UAT BuildCookRun (`.cursorrules §8.2`) deployed to Quest 3. All three Phase 3 polish items confirmed on Vulkan/arm64:
+
+- Correct exposure on the receiver — `RTF_RGBA8_SRGB` honored on Vulkan; browser side matches what the headset wearer sees.
+- Stable 30 fps under head movement — `0.0333` SceneCapture timer + async `FRHIGPUTextureReadback` hold up on Adreno 740.
+- Bidirectional audio still functional — no regression from the perf/color changes.
+
+**Phase 3 is now fully closed.**
+
+**Clean-rebuild gotcha worth pinning to operational memory.** The first UAT attempt of the session failed in 80 s with 20 `redefinition of …` errors in `GenericPlatform.h` during the arm64 compile of `AgoraVideoPump.gen.cpp`. Diagnosis: stale `Intermediate/` from the 2026-06-01 in-flight build. That earlier build was using a *different* `AgoraVideoPump.cpp` (synchronous `ReadPixels`) AND a *different* `.Build.cs` (no `AgoraPlugin`/`RenderCore`/`RHI` deps). UBT reused the cached UHT-generated `.gen.cpp` + PCHs against today's polished code, ending up with two non-canonicalised paths for the same engine header (mixed forward/backslash in `Runtime\Core\Public/GenericPlatform/GenericPlatform.h`), which defeats `#pragma once`.
+
+Cure per `.cursorrules §8.4`: `rmdir /s /q` of `Binaries/`, `Intermediate/`, `Build/`, `Saved/StagedBuilds/`. (`Intermediate/Android/...` hit the Windows MAX_PATH limit and needed the `robocopy /MIR <empty>` trick to delete — standard Windows long-path workaround.) Cold rebuild after clean succeeded in **5 m 44 s**.
+
+**Lesson:** any time a `.cpp` is structurally rewritten (sync → async, etc.) AND `.Build.cs` deps change in the same session — especially if either change happened on a different workstation that this PC never ran a cold cook against — force a clean of `Intermediate/` before the next BuildCookRun. Live Coding hot-reload would have caught the include-path issue earlier; cold cooks bypass that signal.
+
+**Web_Dashboard introduction — first piece of Phase 4 lands.** New top-level `Web_Dashboard/` folder with two coexisting operating modes:
+
+- **Mode A — Step 1 static MVP receiver.** Single-page vanilla JS + Agora Web SDK v4.20.0 from CDN. Two-column layout (`.stream-view` left, `.control-deck` right) so the Phase 5 command deck slots into the right panel without restructuring the markup. Form-based credentials (App ID + channel + token) persist to `localStorage`. CSS design tokens isolated in `public/css/tokens.css`. No build step; serve `public/` with `npx serve` or `python -m http.server`. Self-hosted replacement for `https://webdemo.agora.io/basicVideoCall/`.
+
+- **Mode B — Phase 4 server scaffold.** `server.js` (Express + Socket.IO entry, kept thin per §4.3) + `src/agora.js` + `src/pairing.js` + `src/commands.js` + `docs/commands.md`. Deps: `express` ^5.2, `socket.io` ^4.8, `agora-token` ^2.0, `dotenv` ^17.4. Implements:
+  - `getAgoraCredentials(tenantId)` indirection — single seam for the future multi-tenant credential split (§4.3.1).
+  - `mintToken({ tenantId, channel, uid, role })` — 30-min default TTL, per-channel binding (the 2026-06-01 token-mismatch crash lesson), usage row per issuance to stdout.
+  - `channelNameFor(tenantId, code)` — centralises the canonical `t-<tenantId>-<pairingCode>` naming so neither client nor BP ever hand-builds the string.
+  - In-memory `ROOMS` registry keyed by 4-digit code, handles `headset:register` / `instructor:join` / `disconnect` lifecycle, broadcasts `session:status` (`waiting` | `connected` | `reconnecting`).
+  - `POST /api/token` endpoint gated on a registered pairing code (closes the "any rando mints a token for any channel" hole).
+  - `instructor:command` → `headset:command` relay with full §5.2 schema validation; unknown / malformed payloads dropped + logged, never forwarded.
+
+  **Server scaffolded but not yet wired to the SPA.** The static MVP still uses the manual token-paste flow. Wiring the SPA to the server (replace the manual token field with a 4-digit code field that calls `/api/token` after `instructor:join`) is the next discrete unit of work.
+
+- **Step 1.5 — bidirectional voice on the MVP.** Closes the `.cursorrules §1.3` "bi-directional voice" requirement. Browser publishes the instructor's mic via `AgoraRTC.createMicrophoneAudioTrack({ AEC, ANS, AGC })` + `client.publish()`. Three live controls added under the video per §2.B.3: mic mute (toggles `micTrack.setEnabled`), speaker mute (sets remote audio volume to 0; preserves slider position), volume slider (0–100, scales remote audio track via `setVolume`). Graceful degradation: if mic permission is denied or no input device exists, the join still succeeds, video + receive-audio still work, mic button shows "Mic unavailable" disabled. Verified on hardware: trainee in Quest 3 hears instructor through Quest speakers, instructor hears trainee through laptop speakers, both directions clean.
+
+**Browser secure-context note.** `getUserMedia()` (the mic request) only works on `https://` or `http://localhost`. Serving the page from a LAN IP without HTTPS will reject the mic request. Phase 4 will need to either tunnel via HTTPS or document the localhost-only constraint for the v1 instructor workflow.
+
 ### Open Backlog Items
 
 - **BP polish (do before any fresh install scenario):** bump BeginPlay `Delay` 0.1s → 0.5s (or 1.0s) to eliminate the cold-launch permission race documented in the 2026-06-01 on-headset entry.
-- **Phase 3 — Quest verification of the polished build:** deploy with the 2026-06-03 polish in place (async readback, 30 Hz timer, `RTF_RGBA8_SRGB` RT) and confirm the web demo on a phone-hotspot receiver shows correctly-exposed scene content at steady 30 fps with no game-thread spikes. The original 2026-06-01 in-flight build is obsolete — re-run UAT from scratch. If Quest exhibits any new symptom, previously-documented fallbacks still apply: `VIDEO_PIXEL_BGRA` → `VIDEO_PIXEL_RGBA` for red-blue swap; profile pump CPU cost if frame pacing degrades.
-- **Phase 4:** scaffold `Web_Dashboard/` (Node.js + Express + Socket.IO) per `.cursorrules §3` and `§4.3`, with `agora.js` token minter per `§4.3.1` (single shared App ID / channel-naming-convention tenant isolation, 30–60 min token TTL, usage-row logging, **per-channel token binding — never reuse across channel names**).
+- **Phase 4 — wire SPA to server:** replace the manual token paste in `Web_Dashboard/public/js/main.js` with a 4-digit code field that calls `instructor:join` over Socket.IO, then `POST /api/token` to fetch a server-minted token before `client.join()`. Add the `token-privilege-will-expire` SDK event handler to re-fetch tokens mid-session. The static-only Mode A workflow should keep working as a fallback / debug path.
+- **Phase 4 — wire headset to server:** install a UE Socket.IO plugin per `.cursorrules §4.2`, scaffold a `USignalingSubsystem` (UGameInstanceSubsystem) that owns `headset:register` + token fetch + `headset:command` dispatch into the BP layer. Replace the BP's currently-hardcoded App ID + Token with server-minted credentials.
 - **Phase 5:** instructor SPA — 4-digit code gatekeep, two-column dashboard (stream view + control deck), JSON command dispatch per `§5.2`.
 - Move the prototype App ID / Token out of BP into a non-source-controlled config asset once Phase 4 lands.
 - Rename `VRPawn` → `BP_VRPawn` to match `.cursorrules §4.2` naming convention (cosmetic refactor; not urgent).
