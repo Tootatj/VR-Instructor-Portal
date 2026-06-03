@@ -10,7 +10,11 @@ public class VR_Project : ModuleRules
 	
 		PublicDependencyModuleNames.AddRange(new string[] { "Core", "CoreUObject", "Engine", "InputCore" });
 
-		PrivateDependencyModuleNames.AddRange(new string[] {  });
+		// AgoraPlugin: native IMediaEngine::pushVideoFrame() / setExternalVideoSource() are C++ only
+		// (not exposed in the plugin's Blueprint surface), so UAgoraVideoPump links against the
+		// plugin's public C++ headers. RenderCore + RHI are required for the render-thread RT
+		// readback that feeds each pushed frame.
+		PrivateDependencyModuleNames.AddRange(new string[] { "AgoraPlugin", "RenderCore", "RHI" });
 
 		// Uncomment if you are using Slate UI
 		// PrivateDependencyModuleNames.AddRange(new string[] { "Slate", "SlateCore" });

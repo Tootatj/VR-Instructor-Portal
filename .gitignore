@@ -24,6 +24,10 @@ Build/
 # install discipline" entry for the canonical install instructions.
 VR_Project/Plugins/AgoraPlugin/
 
+# Per-developer Unreal Insights profiling artifacts (e.g. UECommandLine.tracing.txt
+# hardcodes the dev's LAN trace-host IP). Generated locally during perf passes.
+VR_Project/Profiling/
+
 # OS generated files
 .DS_Store
 Thumbs.db

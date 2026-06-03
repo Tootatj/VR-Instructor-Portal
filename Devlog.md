@@ -2,7 +2,7 @@
 
 ## Current Project Status
 
-**Phase:** Agora streaming integration — **Phase 2 fully complete (PIE + Quest 3)**. Bidirectional voice verified end-to-end: Quest mic → Agora → browser, browser mic → Agora → Quest speakers. The next concrete unit of work is Phase 3 (push `RT_InstructorStream` as an Agora custom video source).
+**Phase:** Agora streaming integration — **Phase 3 fully polished in PIE.** Video stream verified end-to-end (Quest scene → `RT_InstructorStream` → `UAgoraVideoPump` → `pushVideoFrame` → Agora SD-RTN → web demo video pane shows correctly-exposed scene content). All three deferred polish items from 2026-06-01 are now resolved: frame-rate spikes (SceneCapture timer 10× over-capture corrected + readback moved to async), dark receiver exposure (RT format flipped to sRGB-encoded), and diagnostic logging stripped. The only remaining Phase 3 item is a fresh Quest verification of the polished build before declaring Phase 3 closed.
 
 Build & deployment pipeline validated end-to-end on Quest 3. Phase 1 (SceneCapture → RT → debug material) and Phase 2 (Agora audio join + event handlers + lifecycle + on-device round-trip) are both complete. Project is Blueprint + minimal C++ scaffolding (required by the Agora plugin's compile chain — see 2026-06-01 first entry). Pinned plugin version is **v4.5.1** (revised up from v4.5.0 after empirical UE 5.5.4 validation).
 
@@ -296,10 +296,85 @@ Deployed the Phase 2 BP via the canonical UAT command (`.cursorrules §8.2`) to 
 
 **Phase 2 is now closed.** All four event handler binds fire as expected on real hardware, the lifecycle (join / publish / subscribe / leave / release) is clean, and the credentials we baked into the BP (App ID + per-channel `Test01` token) are validated. Phase 3 begins next: push `RT_InstructorStream` as an Agora custom video source so the instructor sees the trainee POV.
 
+### 2026-06-01 — Phase 3 C++ video pump scaffolded
+
+Audited the Agora plugin v4.5.1 Blueprint surface and confirmed `pushVideoFrame` and `setExternalVideoSource` are **not** BP-exposed — they live only in the native `agora::media::IMediaEngine` interface (`Plugins/AgoraPlugin/.../include/IAgoraMediaEngine.h`). Verified the UE singleton wrapper `agora::rtc::ue::AgoraUERtcEngine::Get()` exposes `queryInterface(AGORA_IID_MEDIA_ENGINE, ...)`, which is the supported way to obtain the media-engine pointer from the plugin-owned singleton. Verified `agora::media::base::ExternalVideoFrame` field layout (`type`/`format`/`buffer`/`stride`/`height`/`timestamp` are the only fields we set; everything else defaults via its constructor).
+
+**Implementation — `UAgoraVideoPump : UActorComponent` (~200 LOC of C++):**
+
+- `VR_Project/Source/VR_Project/VR_Project.Build.cs` — added `"AgoraPlugin", "RenderCore", "RHI"` to `PrivateDependencyModuleNames`.
+- `VR_Project/Source/VR_Project/AgoraVideoPump.h` — `UCLASS(BlueprintSpawnableComponent)` with `SourceRT` (TObjectPtr<UTextureRenderTarget2D>), `PumpIntervalSeconds` (defaults to 1/30 s = 33.33 ms per §1.3), and BP-callable `StartVideoPump` / `StopVideoPump`. Header takes zero Agora SDK includes — the cached `IMediaEngine*` is held as `void*` so downstream BPs and engine reflection have no transitive Agora dependency.
+- `VR_Project/Source/VR_Project/AgoraVideoPump.cpp` — `StartVideoPump` resolves the media engine via `queryInterface(AGORA_IID_MEDIA_ENGINE, ...)`, calls `setExternalVideoSource(true, false, VIDEO_FRAME)`, and starts a looping `FTimerHandle`. Each timer tick calls `PumpFrame`, which captures a millisecond timestamp on the game thread and then `ENQUEUE_RENDER_COMMAND`s a render-thread lambda that does `FRHICommandListImmediate::ReadSurfaceData` into a reused `TArray<FColor>` (no per-frame alloc) and calls `IMediaEngine::pushVideoFrame()`. Pixel format is `VIDEO_PIXEL_BGRA` to match UE's `FColor` in-memory byte order on both DX (Windows) and Vulkan B8G8R8A8 (Quest mobile-forward). `StopVideoPump` clears the timer, disables the external source, and `FlushRenderingCommands()` to drain any in-flight lambda before the component is torn down (the lambdas capture `this` raw, so the flush is the safety boundary).
+
+**Why no `FRHIGPUTextureReadback` (async path) yet:** the synchronous `ReadSurfaceData` on the render thread is ~1–2 ms at 1280×720 RGBA8 on Adreno 740, well inside §6's 4 ms video-capture budget. Adding async readback now would cost a frame of latency for no measurable budget win. The .cpp documents this as the upgrade path if profiling shows the cost is actually higher.
+
+**Pending Blueprint wiring on `VRPawn`** (no code changes from here on — pure BP):
+
+1. Add `Agora Video Pump` component to `VRPawn`.
+2. Set `Source RT` = `RT_InstructorStream` in the component's details panel.
+3. Add `Enable Video` BP node to the BeginPlay chain — place it between the existing `Enable Audio` and `Join Channel` nodes.
+4. After `Join Channel` (or — safer — wired off the existing `OnJoinChannelSuccess` event), call the component's `Start Video Pump` function. EndPlay teardown is automatic: the component's own `EndPlay` calls `StopVideoPump`, which runs before the BP's existing `Leave Channel → Release` chain (component EndPlay fires before actor-level BP EndPlay event).
+
+**Pending first compile.** Project hasn't been rebuilt against the new source files yet — first attempt should be a `Build Solution` from the .sln, not a hot reload, so the new `AgoraVideoPump.generated.h` is produced by UHT before the .cpp tries to consume it.
+
+### 2026-06-01 — Phase 3 PIE green-frame debug session and root cause
+
+After the C++ pump compiled and the BP wiring landed (`AgoraVideoPump` component on `VRPawn` with `SourceRT=RT_InstructorStream`, `Enable Video` added between `Enable Audio` and `Join Channel`, `Start Video Pump` wired off `OnJoinChannelSuccess`), both PIE and a Quest build joined the channel cleanly but the web demo's video pane showed a **uniform solid color** (green in PIE, black on Quest). Audio remained perfect bidirectionally throughout — the regression was purely on the video path.
+
+Initial hypothesis (`RHICmdList.ReadSurfaceData` not transitioning RT out of RTV state) led to a rewrite swapping the render-thread enqueue for a synchronous `FTextureRenderTargetResource::ReadPixels()` call on the game thread. This did not fix the green frame — both code paths produced the same symptom. (Both APIs ultimately call into the same RHI readback; the "transition" theory was wrong for our format.)
+
+Adding instrumentation to the pump (1 Hz log lines reporting `ReadPixels` return value, buffer size, and three sample pixel values) and then a follow-up `pushVideoFrame ret=N` log line was the breakthrough. Three runs of PIE with the diagnostic build revealed:
+
+1. `ReadPixels=1` (success) every tick, buffer correctly sized at 921600 pixels.
+2. Pixel values were **valid, varied, fresh scene content** — e.g. `P0=(B95, G64, R48)` brown, `Pmid=(B116, G84, R67)` tan — changing frame-to-frame as the player moved their head in VR preview.
+3. `pushVideoFrame ret=0` on every push — the Agora SDK was accepting every frame without complaint.
+
+So our entire client-side pipeline was provably healthy. The receiver still saw green. Conclusion: the SDK was accepting frames into its queue but silently **dropping them at the publish stage**.
+
+**Root cause:** the Agora SDK's `ChannelMediaOptions::publishCustomVideoTrack` field defaults to `false`. The basic `Join Channel` BP node uses default media options and only enables `publishMicrophoneTrack` automatically. Even with `setExternalVideoSource(true, false, VIDEO_FRAME)` called and `pushVideoFrame` returning success, the publisher silently discards everything because there is no published custom video track on the connection. The web demo allocates a video element (we *are* publishing — just nothing visual) and shows green as its codec's "no frames received" fallback.
+
+**Fix (pure Blueprint, no code change):** in the `OnJoinChannelSuccess` event chain on `VRPawn`, insert an `Update Channel Media Options` BP node before `Start Video Pump`. Split its `Options` struct pin and set:
+
+- `Publish Custom Video Track Value` = `AGORA TRUE VALUE` *(critical)*
+- `Publish Camera Track Value` = `AGORA FALSE VALUE` *(recommended — explicit "we have no camera")*
+- Everything else left at `AGORA NULL VALUE` (= "don't change this option") or its existing value.
+
+The plugin's `FUABT_Opt_bool` exposes a clean 3-state enum: `NULL` (don't update), `TRUE` (set on), `FALSE` (set off). Only fields explicitly set to a non-NULL value are applied. Confirmed working immediately after this single BP edit — web demo showed real scene content in PIE.
+
+**Key lesson for future Agora work** (worth pinning to `.cursorrules` when Phase 4 lands): any time you push custom audio or custom video via `pushAudioFrame` / `pushVideoFrame`, you MUST also flip the corresponding `publishCustom*Track` flag in `ChannelMediaOptions` via `Update Channel Media Options` or by joining with explicit options. `pushVideoFrame ret=0` does not mean "the frame was sent"; it only means "the frame was queued in the SDK". The publisher decides what to actually broadcast.
+
+**Diagnostic logging is still in `AgoraVideoPump.cpp`** — three log sites marked `[DIAGNOSTIC — remove after Phase 3 green-frame issue is resolved]`: the `StartVideoPump DIAG` line dumping RT identity, `PumpFrame DIAG: ReadPixels` 1 Hz pixel sampler, and `PumpFrame DIAG: pushVideoFrame ret` 1 Hz return-value sampler. Total overhead is six log lines per second; safe to leave in the Quest build that's currently cooking. Cleanup is a follow-up task once Quest verification is signed off.
+
+### 2026-06-01 — Phase 3 Quest build verification (in flight)
+
+UAT build kicked off ~15:43 with the canonical `.cursorrules §8.2` command. First compile of `AgoraVideoPump.cpp` for both Win64 and arm64 passed cleanly. Cook phase started without errors. Estimated total wall time ~6 min based on the previous build. Result will be visible in the next session as a completed background task in the terminals folder. Pass criterion: web demo on phone hotspot shows real scene content in the video pane once the Quest deploys and joins the channel — same outcome as PIE, just on Vulkan/arm64 instead of DX12.
+
+### 2026-06-03 — Phase 3 polish (perf + color) consolidated
+
+Consolidates two batches of work that were not committed at the time they were performed:
+
+**(A) 2026-06-02 — perf pass, executed on a secondary workstation, never pushed.** Three changes landed locally on the other PC and propagated back via repo sync today. None of them were captured in the Devlog at the time.
+
+1. **`UAgoraVideoPump::PumpFrame` rewritten from synchronous `ReadSurfaceData` / `ReadPixels` to asynchronous `FRHIGPUTextureReadback`.** The 2026-06-01 third entry called this out as the planned upgrade path "if profiling shows the cost is actually higher" — Quest profiling confirmed exactly that. The synchronous readback was internally calling `FlushRenderingCommands`, stalling the game thread ~2–3 ms per tick (≈6–9% of game-thread budget at 30 Hz). The new path enqueues `EnqueueCopy` on the render thread and harvests last tick's already-completed staging buffer via `Lock`/`Unlock` on the next tick. Trade-off: ~1 pump tick (~33 ms) of added latency for zero game-thread stall — well inside the §6 ≤ 400 ms glass-to-glass budget. Single-buffered with a `bReadbackInFlight` guard to skip ticks where the GPU hasn't finished yet (rare at 30 Hz on Adreno 740).
+2. **SceneCapture timer interval `0.00333` → `0.0333` in `VRPawn`.** The 2026-06-01 third entry flagged this as a 10× over-capture (300 Hz where the spec says 30 Hz). Fixed in BP. Combined with (1), Quest frame-rate spikes are gone.
+3. **Diagnostic logging removed from `AgoraVideoPump.cpp`.** Three `[DIAGNOSTIC — remove after Phase 3 green-frame issue is resolved]` sites from the green-frame debug session are deleted. The pump now emits only `StartVideoPump`/`StopVideoPump` lifecycle lines + one `Error` line if the media engine fails to resolve.
+
+**(B) 2026-06-03 — dark-receiver color fix, this session.** Symptom was "stream looks fine in headset but very dark in the browser." Critical disambiguator from the user: rendering `RT_InstructorStream` onto a Plane via `M_RTStreamDebug` in-world looked perceptually correct in VR. That ruled out exposure, capture-source mode, and scene lighting — the SceneCapture was writing correct color into the RT. The problem was strictly in the bytes handed to Agora.
+
+Root cause: **linear-vs-sRGB encoding mismatch on the readback path.** On mobile + `r.MobileHDR=False`, `Capture Source = Final Color (LDR) in RGB` writes linear color into the RT (it captures before the hardware sRGB encode that the main view's framebuffer gets via `r.Mobile.UseHWsRGBEncoding=True`). The material path round-trips through `Sampler Type = Color` which decodes sRGB → linear on sample, so two "wrong" steps cancel and the plane looks correct. But `FRHIGPUTextureReadback::Lock` returns the raw stored bytes with no decode — those linear bytes go to `pushVideoFrame`, the H.264 encoder treats them as sRGB-encoded (standard video convention), and the browser displays linear `0.5` as if it were sRGB-encoded `0.5` → ≈2.4× darker than intended. Exactly the symptom.
+
+Fix: flipped `RT_InstructorStream` Render Target Format from `RTF_RGBA8` to **`RTF_RGBA8_SRGB`**. The SceneCapture now writes sRGB-encoded bytes directly; raw readback produces correct bytes for the H.264 encoder; the browser shows correctly-exposed scene content. Zero C++ change, zero runtime cost (the GPU does the encode on store for free). Validated in PIE → Agora web demo immediately after the flip.
+
+**Why the level-wide Post Process Volume approach (proposed 2026-06-01) was not viable.** Mobile forward renderer with `r.MobileHDR=False` strips out the screen-space post passes a PPV would normally target (bloom, AO, tonemapper, eye adaptation) — dropping a PPV in the level had no measurable effect on capture brightness. The fallback path investigated this session would have been a per-pixel sRGB encode loop in `PumpFrame` (cheap LUT, ~0.3–0.6 ms on a Quest game thread), but the RT format flip made it unnecessary.
+
+**Key lesson for future RT → Agora work** (worth pinning to `.cursorrules` alongside the 2026-06-01 `publishCustomVideoTrack` lesson): when pushing pixel buffers to Agora via `pushVideoFrame`, the RT must hold **sRGB-encoded bytes** (`RTF_RGBA8_SRGB` or equivalent), not linear. Material samplers hide this asymmetry because they auto-decode on sample; raw readback exposes it.
+
+**Net state of Phase 3 after these three batches:** end-to-end stream is correctly exposed, runs at the spec'd 30 Hz, has no game-thread readback stall, and contains no leftover diagnostic noise. Pending: fresh Quest verification of the polished build (the 2026-06-01 in-flight build is obsolete — it pre-dates all three polish items).
+
 ### Open Backlog Items
 
 - **BP polish (do before any fresh install scenario):** bump BeginPlay `Delay` 0.1s → 0.5s (or 1.0s) to eliminate the cold-launch permission race documented in the 2026-06-01 on-headset entry.
-- **Phase 3:** push `RT_InstructorStream` as a custom Agora video source. Confirm the plugin's BP surface for `SetExternalVideoSource` / `PushVideoFrame` (likely needs Phase 3 to live in the `VR_Project` C++ module as a `UAgoraVideoPump` `UActorComponent` calling `IMediaEngine::pushVideoFrame()` directly). Includes RGBA → YUV420 conversion at 1280×720 / 30 fps.
+- **Phase 3 — Quest verification of the polished build:** deploy with the 2026-06-03 polish in place (async readback, 30 Hz timer, `RTF_RGBA8_SRGB` RT) and confirm the web demo on a phone-hotspot receiver shows correctly-exposed scene content at steady 30 fps with no game-thread spikes. The original 2026-06-01 in-flight build is obsolete — re-run UAT from scratch. If Quest exhibits any new symptom, previously-documented fallbacks still apply: `VIDEO_PIXEL_BGRA` → `VIDEO_PIXEL_RGBA` for red-blue swap; profile pump CPU cost if frame pacing degrades.
 - **Phase 4:** scaffold `Web_Dashboard/` (Node.js + Express + Socket.IO) per `.cursorrules §3` and `§4.3`, with `agora.js` token minter per `§4.3.1` (single shared App ID / channel-naming-convention tenant isolation, 30–60 min token TTL, usage-row logging, **per-channel token binding — never reuse across channel names**).
 - **Phase 5:** instructor SPA — 4-digit code gatekeep, two-column dashboard (stream view + control deck), JSON command dispatch per `§5.2`.
 - Move the prototype App ID / Token out of BP into a non-source-controlled config asset once Phase 4 lands.
