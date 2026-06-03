@@ -489,8 +489,40 @@ Real Quest 3 successfully joined the OneBonsai grid as a tile alongside web-fake
 
 **Lesson (worth pinning).** Sub-modifier classes that change a parent's flex direction (`.field` column → `.field--inline` row) need to also defensively reset child-element styles the parent established for the previous direction. Putting a checkbox inside a label class designed for text inputs is a common pattern that needs explicit unstyling.
 
+### 2026-06-03 — Phase 4.5 Pico 4E sideload attempt (PARKED — empirical 2D-fallback finding)
+
+Followed up the Quest verification by attempting to sideload the same APK onto a Pico 4 Enterprise (PUI 5 / Android 10 / API 29, manufacturer:Pico model:A8110, abi:arm64-v8a). Two distinct obstacles surfaced, the second of which is the genuinely interesting one.
+
+**Obstacle 1: `INSTALL_FAILED_OLDER_SDK`.** `adb install -g` rejected the Quest APK because the manifest declared `minSdkVersion=32` (Android 12L) but Pico runs API 29. Root cause: `bPackageForMetaQuest=True` in `Config/DefaultEngine.ini` enforces Meta's current store spec of minSdk 32+ at build time. Workaround applied: temporarily lowered `MinSDKVersion=32 → 29` and set `bPackageForMetaQuest=False`. Rebuilt + redeployed via UAT (`-deploy -device=PA8E50MGH1110583D`, ~2-3 min — incremental cook, manifest-only change). APK installed cleanly on Pico (`adb.exe ExitCode=0`).
+
+**Obstacle 2 (the real one): app runs on Pico but in 2D, not in VR.** Launched via `adb shell am start -n com.Thomas.VRProject/com.epicgames.unreal.GameActivity`, pre-granted `RECORD_AUDIO`. Pico screenshot (sent by user) shows the UE template scene rendered as a curved 2D Android panel inside the Pico's home environment — Pico's controller laser ray visible, Pico's "earth-in-space" home background bleeding around the panel. Classic OpenXR-runtime-not-bound symptom.
+
+**Root cause (confirmed by analysis, not yet by logcat).** The UE build uses Meta's `OculusOpenXRLoader` (bundled by the OculusXR/MetaXR plugin). That loader is hardcoded to look for **Meta's** OpenXR runtime — it doesn't probe the Android system for vendor-alternative OpenXR runtimes. On the Pico:
+
+- Pico ships its own OpenXR runtime (system-level since PUI 5+).
+- Meta's loader doesn't find Meta's runtime → falls back silently to no-XR.
+- UE's XR system initializes to "no XR" → app boots as a normal Android Activity.
+- Pico's OS sees a non-VR Android app → composites it as a 2D panel in the home environment.
+
+The clean failure mode (no crash, no FATAL in logcat, no Vulkan errors) supports this diagnosis cleanly. APK install + Android plumbing + arm64 binary + rendering pipeline are all fine — only the XR handshake fails.
+
+**Decision: parked.** The OneBonsai grid-view demo target is fully covered by the Quest path (validated in the previous entry). Pico parity is real cross-platform work that doesn't fit a config-flag flip. Reverted `MinSDKVersion` and `bPackageForMetaQuest` back to their Meta-store-compliant values so the current Quest build path stays clean. The Pico's APK install + ini changes are not preserved; next Pico work cycle restarts from the same starting point.
+
+**Concrete options recorded for the future Pico work session.**
+
+1. **Swap OculusXR plugin → vanilla Khronos `OpenXR` plugin.** UE's built-in `OpenXR` plugin uses the system's OpenXR loader rather than a vendor-bundled one. Should work on both Quest (Meta runtime) and Pico (Pico runtime) from a single APK. Trade-off: loses Meta-specific extensions (hand tracking, anchors, controller models) and needs Quest re-validation. ~30-45 min plus testing.
+2. **Install PICO Unreal Integration SDK + maintain two build flavors.** Each device gets its native runtime + extensions. Largest footprint but production-grade. Use `Config/Android_Multi/` to split the build flavors. ~1-2 hours including SDK download from Pico developer portal.
+3. **Pico 4 Enterprise OS update path (PUI 5 → PUI 6/Android 13).** Settings → General → System Update. May require Pico Business Suite enrollment. Even if successful, *won't* solve Obstacle 2 — Meta's loader still won't find Meta's runtime on Pico hardware regardless of PUI version. Only useful if we keep `minSdk=32` and want to install the Quest APK on Pico without rebuilding.
+
+**Things learned worth pinning.**
+
+- `bPackageForMetaQuest=True` is a build-time enforcer, not just a tag. It actively overrides `MinSDKVersion` upward to whatever Meta's current spec requires (currently 32). For Pico-compatible sideload builds, this flag must be off.
+- Meta's `OculusOpenXRLoader` and Khronos's vendor-neutral `OpenXR` loader are mutually exclusive. The OculusXR plugin bundles the former and assumes it will be the active loader at runtime — it won't gracefully cede to a system loader if Meta's runtime is missing.
+- The Pico's "fall back to 2D panel inside home environment" behavior is a clean failure mode that's easy to misdiagnose as a Pico bug. It's actually Pico's OS doing the right thing with a non-VR Android app. The actual failure is on the UE/Meta-loader side.
+
 ### Open Backlog Items
 
+- **Pico cross-platform parity (Phase 4.5b — deferred):** see the three options in the 2026-06-03 Pico parked entry. Khronos OpenXR plugin swap (option 1) is the lowest-effort path if/when Pico parity becomes a priority. Until then, the OneBonsai demo runs Quest-only.
 - **Phase 4 — wire headset to server:** install a UE Socket.IO plugin per `.cursorrules §4.2`, scaffold a `USignalingSubsystem` (UGameInstanceSubsystem) that owns `headset:register` + token fetch + `headset:command` dispatch into the BP layer. Replace the BP's currently-hardcoded App ID + Token + channel literal with server-minted credentials + a runtime-chosen code (random-on-launch or from a device fingerprint). This is what makes stub mode unnecessary on the dashboard side.
 - **Phase 5 — BP `headset:command` consumer:** bind a command-receive event in `BP_VRPawn` that catches the four §5.2 commands and acts on them (global pause var for `pause_simulation`, `OpenLevel` for `change_environment`, custom event dispatch for `trigger_event`, teleport to start for `reset_user_position`). The faker's `formatCommand` switch is a reference implementation.
 - **Phase 5:** broader instructor-facing polish (auth, per-tenant branding, real session metadata from the headset rather than the stub).
