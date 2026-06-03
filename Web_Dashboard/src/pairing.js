@@ -118,6 +118,49 @@ export function registerPairingHandlers(io) {
     });
 
     // -------------------------------------------------------------------
+    // headset:end — graceful shutdown from the headset side
+    // -------------------------------------------------------------------
+    // Phase E addition. Closes the §5.1 protocol gap where the only way a
+    // room got pruned was via the disconnect handler — which fires AFTER a
+    // ~20-30 s socket timeout when a headset crashes or is power-cycled
+    // without a clean disconnect. The Quest's USignalingSubsystem now emits
+    // this on Deinitialize so the tile disappears from the grid the moment
+    // the trainee finishes the session, not 30 s later.
+    //
+    // Authz: only the socket that's the room's current headsetSocketId can
+    // end the room (prevents a malicious peer from forcibly closing a
+    // session by guessing a 4-digit code).
+    socket.on('headset:end', (payload, ack) => {
+      const code = payload?.code;
+      if (!CODE_PATTERN.test(code ?? '')) {
+        ack?.({ ok: false, error: 'code must be a 4-digit string' });
+        return;
+      }
+      const room = ROOMS.get(code);
+      if (!room) {
+        ack?.({ ok: true, alreadyEnded: true });
+        return;
+      }
+      if (room.headsetSocketId !== socket.id) {
+        ack?.({ ok: false, error: 'not the owning headset' });
+        return;
+      }
+
+      const tenantId = room.tenantId;
+
+      // Tell any pinned instructor (legacy 1:1 path) that the session is
+      // really gone — distinct from the transient "reconnecting" state the
+      // disconnect handler emits.
+      io.to(roomName(code)).emit('session:status', { state: 'ended' });
+
+      ROOMS.delete(code);
+      console.log(`[VRIP] headset:end code=${code} tenant=${tenantId} sock=${socket.id}`);
+
+      ack?.({ ok: true });
+      broadcastSessionsChanged(io, tenantId);
+    });
+
+    // -------------------------------------------------------------------
     // instructor:subscribe-tenant — grid-view instructors land here
     // -------------------------------------------------------------------
     // Replaces the 1:1 instructor:join model for the grid view: one

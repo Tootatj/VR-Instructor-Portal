@@ -16,6 +16,12 @@ public class VR_Project : ModuleRules
 		// readback that feeds each pushed frame.
 		PrivateDependencyModuleNames.AddRange(new string[] { "AgoraPlugin", "RenderCore", "RHI" });
 
+		// SocketIOClient (getnamo) + its JSON helper module: USignalingSubsystem speaks the
+		// dashboard's Socket.IO protocol (headset:register, headset:command, etc.) and uses
+		// the BP-facing FSIOJsonObject for ack payloads. HTTP + Json are stock UE modules
+		// needed for the POST /api/token call that mints the Agora token after register.
+		PrivateDependencyModuleNames.AddRange(new string[] { "SocketIOClient", "SIOJson", "HTTP", "Json" });
+
 		// Uncomment if you are using Slate UI
 		// PrivateDependencyModuleNames.AddRange(new string[] { "Slate", "SlateCore" });
 		

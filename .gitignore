@@ -23,6 +23,8 @@ Build/
 # See README.md "Setup -> step 2" and the Devlog 2026-05-28 "Phase 2: Plugin
 # install discipline" entry for the canonical install instructions.
 VR_Project/Plugins/AgoraPlugin/
+VR_Project/Plugins/SocketIOClient/
+VR_Project/Plugins/PICOXR/
 
 # Per-developer Unreal Insights profiling artifacts (e.g. UECommandLine.tracing.txt
 # hardcodes the dev's LAN trace-host IP). Generated locally during perf passes.

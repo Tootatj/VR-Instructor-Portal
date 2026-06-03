@@ -94,6 +94,7 @@ per-device channel rename recipe.
 | `GET /api/sessions?tenantId=X&page=N&pageSize=M` | client → server | Paginated list of active sessions for a tenant. |
 | `POST /api/token` | client → server | Mints a short-lived RTC token. Body: `{ code, role, uid? }`. Requires the pairing code to already be registered by a headset (no rando minting). |
 | Socket.IO `headset:register` | headset → server | Headset (or faker) claims a 4-digit code. Payload: `{ code, tenantId, scenario?, traineeName?, source? }`. |
+| Socket.IO `headset:end` | headset → server | Graceful shutdown from the owning headset (Phase 4 `USignalingSubsystem::Deinitialize`). Payload: `{ code }`. Server prunes the room immediately instead of waiting on the ~30 s disconnect timeout. Authz: only the socket that holds the room's `headsetSocketId` may end it. |
 | Socket.IO `instructor:subscribe-tenant` | instructor → server | Grid-view subscription: receive all sessions for a tenant + live `sessions:changed` updates. Payload: `{ tenantId }`, acks with the initial session list. |
 | Socket.IO `instructor:join` | instructor → server | Legacy 1:1 pairing for single-session debug view. Payload: `{ code }`. |
 | Socket.IO `instructor:command` | instructor → server | Dispatch a §5.2 command. Payload includes `code` to target a specific session in the grid view. Validated server-side. |
@@ -104,18 +105,33 @@ per-device channel rename recipe.
 See `docs/commands.md` for the canonical command schema enforced by
 `src/commands.js`.
 
-## Real headset wiring (still pending)
+## Real headset wiring
 
-The Quest / Pico builds currently bake an Agora App ID + a 24-hour
-temporary token + a hardcoded channel name into `BP_VRPawn`. To put
-real headsets on the OneBonsai grid alongside the fakers:
+As of Phase 4 (`USignalingSubsystem`), the Quest build registers with the
+dashboard at launch and fetches server-minted Agora credentials at
+runtime. No more hardcoded channels or 24-hour tokens in `BP_VRPawn`.
 
-| Option | Effort | What it gets you |
-|---|---|---|
-| **Q1 — Per-device channel rename** | ~10 min per device | Build the APK once per device with the channel renamed to `t-onebonsai-XXXX` and a matching temp token. Quick demo path. |
-| **Q2 — UE Socket.IO subsystem** | 1–2 sessions | Install a UE Socket.IO plugin, scaffold `USignalingSubsystem` that emits `headset:register` + fetches tokens from `/api/token` at launch. Architectural endpoint. |
+The UE-side wire-protocol sequence on cold launch:
 
-See `Devlog.md` for the click-paths and shell commands.
+1. Quest boots → `USignalingSubsystem::Initialize` generates a random
+   4-digit pairing code and connects to `ServerUrl` (read from
+   `VR_Project/Config/DefaultGame.ini` section
+   `[/Script/VR_Project.SignalingSubsystem]`).
+2. Emits `headset:register` with `{ code, tenantId, scenario,
+   traineeName, source:"headset" }` + ack callback.
+3. On ack `ok`, POSTs `/api/token` for `{ code, role:"publisher", uid:0 }`.
+4. Stores returned `appId`, `token`, `channel`, `expiresAt` and fires
+   the `OnCredentialsReady` BP delegate. `BP_VRPawn::BeginPlay` is
+   gated behind that delegate and consumes the values via subsystem
+   variable reads (no literal pins).
+5. Schedules a `RefreshToken` ~5 minutes before `expiresAt` and
+   re-emits `headset:register` automatically on socket reconnect with
+   the SAME pairing code (hot reconnect recall).
+6. On `Deinitialize` (clean app exit), fires `headset:end` so the grid
+   tile disappears immediately.
+
+See `VR_Project/Plugins/README.md` for the plugin pin (getnamo
+SocketIOClient-Unreal v2.9.0) and `Devlog.md` for per-phase notes.
 
 ## Conventions
 
