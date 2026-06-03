@@ -405,14 +405,77 @@ Cure per `.cursorrules §8.4`: `rmdir /s /q` of `Binaries/`, `Intermediate/`, `B
 
 **Browser secure-context note.** `getUserMedia()` (the mic request) only works on `https://` or `http://localhost`. Serving the page from a LAN IP without HTTPS will reject the mic request. Phase 4 will need to either tunnel via HTTPS or document the localhost-only constraint for the v1 instructor workflow.
 
+### 2026-06-03 — Phase 4.5: OneBonsai multi-session grid + session faker
+
+Landed the OneBonsai-branded grid view, the session-faker tool, and the server endpoints that connect them. The instructor dashboard is no longer a single-session SPA — it's a tenant-scoped grid with click-to-focus + command deck. The legacy single-session view is preserved at `/single.html` as a known-good debug fallback.
+
+**Why now.** Conceptual discussion converged on "we sell to a company (e.g., Securitas), they monitor all their active VR sessions in a grid, click into one to command it." OneBonsai is the dogfood tenant. To test that UX with one Quest + one Pico, we need synthetic publishers — the faker tool — to populate the grid alongside real headsets. All three pieces shipped this session.
+
+**Server additions (`Web_Dashboard/`).**
+
+- `GET /api/config` — safe-to-expose client config (`appId`, `defaultTenantId`). One source of truth; clients stop baking values into HTML.
+- `GET /api/sessions?tenantId=X&page=N&pageSize=M` — paginated tenant-scoped session discovery. Initial page-load entry point.
+- Socket.IO `instructor:subscribe-tenant { tenantId }` — grid-view instructors land here instead of the 1:1 `instructor:join`. Acks with the initial session list, then receives live `sessions:changed` broadcasts on every headset register/disconnect.
+- Socket.IO `sessions:changed { tenantId, sessions }` — tenant-scoped fan-out. Each instructor socket joins `tenant:<id>:instructors` and receives only its own tenant's updates.
+- `headset:register` extended with optional `scenario`, `traineeName`, `source` fields. Stored in `ROOMS` along with a `startedAt` unix-ms timestamp so the grid tile can show session duration.
+- `instructor:command` extended with optional `code` field — grid-view instructors target a specific session per command instead of being pinned 1:1 to a room. Server enforces tenant scope (cross-tenant commands rejected). Legacy 1:1 path still works without `code`.
+- `DEFAULT_TENANT_ID` in `.env.example` changed `default` → `onebonsai`.
+
+**Faker tool (`public/faker.html` + `js/faker.js`).** New page that lets us populate the grid with synthetic VR sessions. Each faker:
+
+1. Connects to the Phase 4 Socket.IO server.
+2. Emits `headset:register { code, tenantId, scenario, traineeName, source:'faker' }`.
+3. `POST /api/token` for a publisher token.
+4. Generates an animated procedural video on an HTML canvas — deterministic hue per code, drifting gradient, moving horizon line, bouncing dot, scenario/trainee/code overlay, live timer.
+5. Publishes via `AgoraRTC.createCustomVideoTrack({ mediaStreamTrack: canvas.captureStream(24) })` — no webcam permission, fully procedural.
+6. Listens for `headset:command` and renders a yellow command-received overlay (2.5 s) plus a sticky "PAUSED" overlay when `pause_simulation:true` — verifies the command round-trip end-to-end.
+
+Launcher mode at `/faker.html?spawn=N` opens N popups with pre-canned OneBonsai scenarios (Fire Training / Forklift Sim / Confined Space Rescue / Electrical Lockout / Fall Arrest Drill / Hazmat Response / Confined Crane Op / Welding Safety). Closing a popup drops that session from the grid — exactly as a real headset would.
+
+**Stub mode.** Faker checkbox "register session metadata but don't publish video." Use when a real Quest or Pico is the actual video source on a code: the stub keeps a Socket.IO connection alive (so the grid sees the session in the registry), but skips Agora; the real headset is the sole publisher on that channel. When stub mode is selected, the registered `source` is `'headset'` so the grid pill says LIVE not FAKER. Closing the stub tab prunes the room, matching real-headset lifecycle.
+
+**Grid view client (`public/index.html` + `js/grid.js`).** Two modes coexist in one page:
+
+- **Grid mode (default):** 3×2 CSS Grid of tiles, paginated when sessions > 6. Header shows "OneBonsai — Live Training Sessions" + session count + Prev/Page N of M/Next controls + "Spawn demo sessions" shortcut + link to the debug view. Each tile is a self-contained Agora client subscribed to its session's channel (video only, no audio in grid mode). Tile shows scenario + trainee name + status + LIVE/FAKER pill. Click or Enter/Space focuses a tile.
+- **Focus mode:** clicked tile expands to fill the stage, side panel reveals the §5.2 command deck (Pause / Resume / Reset Position / Change Environment with map-name input / Trigger Event with event-type input). Audio is subscribed in focus mode + instructor mic is published (best-effort, falls back to receive-only if denied). Speaker toggle, mic toggle, volume slider all wired. Per-command ACK feedback in a rolling log. Back-to-grid restores the grid view and re-subscribes its tiles.
+- **Subscribe-only-visible:** entering focus mode tears down ALL grid tile clients (frees bandwidth + CPU for the focused stream + avoids browser background-pause behavior). Exiting focus mode re-subscribes the current page's tiles fresh.
+
+Backed up the previous single-session SPA as `/single.html` (loads `js/single.js`) with a "→ grid view" link in its header for navigation. Anyone still using the manual-token paste flow finds it intact.
+
+**Demo flow (~2 minutes, validated locally).** `npm run dev` → open `/` → header shows `Live · tenant onebonsai` → click "Spawn demo sessions" → 5 popups appear and register, grid populates within ~2 s → click a tile → focus mode + command deck → click "Pause simulation" → faker overlays PAUSED, command log line shows `→ pause_simulation (code XXXX)` → Resume → Back to grid. End-to-end signaling + token mint + multi-publisher Agora subscription + command relay all exercised in one click sequence.
+
+**Getting real Quest / Pico builds into the OneBonsai grid.** Stub mode is the bridge until proper Phase 4 headset wiring lands. Recipe (per device):
+
+1. **Pick a 4-digit code per device.** E.g. `1111` for Quest, `2222` for Pico. Keep them disjoint.
+2. **Generate a temp token** in <https://console.agora.io> > Project Management > the project > Generate Token > channel name `t-onebonsai-1111` (or `-2222`), TTL 24 h, no UID restriction. Note the token string.
+3. **Open `BP_VRPawn` in UE.** Find the `Join Channel` node at the tail of the BeginPlay chain (per the 2026-06-01 entry). Update:
+   - `ChannelId` literal from `Test01` → `t-onebonsai-1111` (or `-2222`).
+   - `Token` literal → the new token from step 2.
+4. **Cook + deploy.** `.cursorrules §8.2` UAT command unchanged. For per-device builds, the BP edit happens once per cook — there's no parametrisation yet. (Adding command-line parameter support is the path to a single-APK multi-device build; deferred for now.)
+5. **On the dashboard PC.** Start `npm run dev`. Open `http://localhost:3000`. Open `/faker.html`, tick "Stub mode", enter:
+   - Tenant ID: `onebonsai`
+   - Code: `1111` (matching the Quest's hardcoded channel suffix)
+   - Scenario: e.g. "Fire Training"
+   - Trainee: e.g. "Demo — Quest 3"
+   Click Start. The status reads `Stub for code 1111 — real headset publishes the video`. The grid now shows a LIVE-pilled tile for that code, awaiting video.
+6. **Launch the Quest app.** It publishes to `t-onebonsai-1111`; the grid tile picks up the video stream. Repeat the stub-mode step in another tab for the Pico's code `2222`.
+7. **Stretch goal (separate session): BP `headset:command` handler.** Bind an Agora-channel-message-equivalent event in the BP to consume the four §5.2 commands and act on them (toggle a global pause var on `pause_simulation`, etc.). Currently the round-trip ends server-side: the relay fires successfully (visible in the command log + server stdout), but the BP has no listener yet. The faker has a listener as a reference implementation; replicating it in BP is straightforward once the UE Socket.IO plugin is installed.
+
+**Pico 4 Enterprise sideload notes.** The existing Quest APK (`VR_Project/Build/Android_ASTC/*.apk`) may install directly on a Pico 4 Enterprise in Developer Mode via `adb install -r <apk>`. Most enterprise Pico devices honor the install regardless of the Meta-specific `<meta-data android:name="com.oculus.supportedDevices" />` baked in by `bPackageForMetaQuest=True` in `Config/DefaultEngine.ini`. If the install is refused, the cleanest fix is to flip `bPackageForMetaQuest=False` and strip the `ExtraApplicationSettings` line in a per-platform `Config/Android/AndroidEngine.ini` override (UE's standard pattern), then re-cook a Pico-specific APK. Runtime cross-platform parity should "just work" via OpenXR — the controllers, head tracking, and standard XR action set are identical between Meta and Pico's OpenXR runtimes. Hand-tracking is the one feature that uses a vendor-specific OpenXR extension and may need the corresponding Pico plugin enabled in `.uproject` if hands are used; controllers-only flows are unaffected.
+
+**Net state.** The OneBonsai grid view is fully testable today with the faker. With per-device BP edits + stub-mode bridges, both real headsets join the grid as additional LIVE tiles. Phase 5 BP command handlers + full Socket.IO subsystem remain on the backlog as the architecturally-clean follow-up.
+
 ### Open Backlog Items
 
 - **BP polish (do before any fresh install scenario):** bump BeginPlay `Delay` 0.1s → 0.5s (or 1.0s) to eliminate the cold-launch permission race documented in the 2026-06-01 on-headset entry.
-- **Phase 4 — wire SPA to server:** replace the manual token paste in `Web_Dashboard/public/js/main.js` with a 4-digit code field that calls `instructor:join` over Socket.IO, then `POST /api/token` to fetch a server-minted token before `client.join()`. Add the `token-privilege-will-expire` SDK event handler to re-fetch tokens mid-session. The static-only Mode A workflow should keep working as a fallback / debug path.
-- **Phase 4 — wire headset to server:** install a UE Socket.IO plugin per `.cursorrules §4.2`, scaffold a `USignalingSubsystem` (UGameInstanceSubsystem) that owns `headset:register` + token fetch + `headset:command` dispatch into the BP layer. Replace the BP's currently-hardcoded App ID + Token with server-minted credentials.
-- **Phase 5:** instructor SPA — 4-digit code gatekeep, two-column dashboard (stream view + control deck), JSON command dispatch per `§5.2`.
+- **Phase 4 — wire headset to server:** install a UE Socket.IO plugin per `.cursorrules §4.2`, scaffold a `USignalingSubsystem` (UGameInstanceSubsystem) that owns `headset:register` + token fetch + `headset:command` dispatch into the BP layer. Replace the BP's currently-hardcoded App ID + Token + channel literal with server-minted credentials + a runtime-chosen code (random-on-launch or from a device fingerprint). This is what makes stub mode unnecessary on the dashboard side.
+- **Phase 5 — BP `headset:command` consumer:** bind a command-receive event in `BP_VRPawn` that catches the four §5.2 commands and acts on them (global pause var for `pause_simulation`, `OpenLevel` for `change_environment`, custom event dispatch for `trigger_event`, teleport to start for `reset_user_position`). The faker's `formatCommand` switch is a reference implementation.
+- **Phase 5:** broader instructor-facing polish (auth, per-tenant branding, real session metadata from the headset rather than the stub).
 - Move the prototype App ID / Token out of BP into a non-source-controlled config asset once Phase 4 lands.
 - Rename `VRPawn` → `BP_VRPawn` to match `.cursorrules §4.2` naming convention (cosmetic refactor; not urgent).
 - Re-color the four Phase 2 Print Strings (currently all yellow) — green/red/cyan/yellow for join/error/peer-join/leave readability.
+- Pico 4 Enterprise sideload — first-attempt with the existing Quest APK; if rejected, add a Pico-specific platform config split.
+- Tighten Socket.IO CORS before any LAN/internet-facing deploy (currently permissive for development).
+- Implicit-room server fallback: if a peer publishes on `t-<tenant>-XXXX` with no matching room, auto-create one so real headsets can show up in the grid even without the stub. Eliminates stub-mode entirely.
 - OpenXR localization warnings in the Output Log (low priority cosmetic).
 - 10-bit swapchain fallback messages (low priority cosmetic).

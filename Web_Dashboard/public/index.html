@@ -3,80 +3,143 @@
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>VR Instructor Portal — Live Session</title>
+  <title>OneBonsai — Live Training Sessions</title>
   <link rel="stylesheet" href="./css/tokens.css">
   <link rel="stylesheet" href="./css/style.css">
 </head>
-<body>
+<body class="grid-page">
   <header class="app-header">
-    <h1 class="app-header__title">VR Instructor Portal</h1>
-    <span class="app-header__subtitle">Step 1 — static receiver MVP</span>
+    <div>
+      <h1 class="app-header__title">OneBonsai</h1>
+      <span class="app-header__subtitle">Live Training Sessions</span>
+    </div>
+    <div class="app-header__actions">
+      <span id="conn-indicator" class="status status--idle">Connecting…</span>
+      <a href="/faker.html?spawn=5" target="_blank" rel="noopener" class="btn btn--secondary btn--sm">
+        Spawn demo sessions
+      </a>
+      <a href="/single.html" class="btn btn--secondary btn--sm">Debug view</a>
+    </div>
   </header>
 
-  <main class="dashboard">
-    <section class="stream-view" aria-labelledby="stream-title">
-      <h2 id="stream-title" class="visually-hidden">Trainee POV</h2>
-      <div id="remote-video" class="stream-view__video">
-        <div class="stream-view__placeholder">
-          <p class="stream-view__placeholder-title">Not connected</p>
-          <p class="stream-view__placeholder-hint">Fill in the panel on the right and join a channel to start receiving the trainee's POV.</p>
+  <main class="grid-main">
+
+    <!-- ===== Grid mode (default) ===== -->
+    <section id="grid-view" class="grid-view" aria-label="Active sessions">
+      <div class="grid-view__header">
+        <h2 class="grid-view__title">
+          Active sessions
+          <span id="session-count" class="grid-view__count">0</span>
+        </h2>
+        <div class="grid-view__pagination">
+          <button id="prev-page-btn" type="button" class="btn btn--secondary btn--sm" disabled>‹ Prev</button>
+          <span id="page-indicator" class="grid-view__page-indicator">Page 1 of 1</span>
+          <button id="next-page-btn" type="button" class="btn btn--secondary btn--sm" disabled>Next ›</button>
         </div>
       </div>
-      <div class="stream-view__status" aria-live="polite">
-        <span id="status-text" class="status status--idle">Idle</span>
-      </div>
 
-      <div id="audio-controls" class="audio-controls" hidden>
-        <button type="button" id="mic-toggle" class="toggle-btn" aria-pressed="false" data-muted="false">
-          <span class="toggle-btn__dot" aria-hidden="true"></span>
-          <span class="toggle-btn__label">Mic on</span>
-        </button>
-        <button type="button" id="speaker-toggle" class="toggle-btn" aria-pressed="false" data-muted="false">
-          <span class="toggle-btn__dot" aria-hidden="true"></span>
-          <span class="toggle-btn__label">Speaker on</span>
-        </button>
-        <label class="volume-control">
-          <span class="volume-control__label">Volume</span>
-          <input type="range" id="volume-slider" min="0" max="100" value="100">
-          <span class="volume-control__value" id="volume-value">100</span>
-        </label>
+      <div id="tile-grid" class="tile-grid">
+        <div id="empty-state" class="empty-state">
+          <p class="empty-state__title">No active sessions</p>
+          <p class="empty-state__hint">
+            Spawn a few demo sessions to populate the grid, or wait for a real
+            headset to connect.
+          </p>
+          <a href="/faker.html?spawn=5" target="_blank" rel="noopener" class="btn btn--primary">
+            Spawn 5 demo sessions →
+          </a>
+        </div>
       </div>
     </section>
 
-    <aside class="control-deck" aria-labelledby="control-title">
-      <h2 id="control-title" class="control-deck__title">Connection</h2>
-
-      <form id="join-form" class="form" autocomplete="off">
-        <label class="field">
-          <span class="field__label">Agora App ID</span>
-          <input type="text" id="app-id" name="appId" required spellcheck="false">
-        </label>
-
-        <label class="field">
-          <span class="field__label">Channel name</span>
-          <input type="text" id="channel" name="channel" required spellcheck="false" placeholder="Test01">
-        </label>
-
-        <label class="field">
-          <span class="field__label">Token</span>
-          <textarea id="token" name="token" required rows="3" spellcheck="false"></textarea>
-        </label>
-
-        <div class="form__actions">
-          <button type="submit" id="join-btn" class="btn btn--primary">Join</button>
-          <button type="button" id="leave-btn" class="btn btn--secondary" disabled>Leave</button>
+    <!-- ===== Focus mode (hidden until a tile is clicked) ===== -->
+    <section id="focus-view" class="focus-view" hidden aria-label="Focused session">
+      <div class="focus-view__stage">
+        <button id="back-to-grid-btn" type="button" class="btn btn--secondary btn--sm focus-view__back">
+          ‹ Back to grid
+        </button>
+        <div id="focus-video" class="focus-view__video">
+          <!-- Agora SDK injects the <video> here. -->
         </div>
-      </form>
+        <div class="focus-view__status">
+          <span id="focus-status" class="status status--connecting">Loading…</span>
+        </div>
 
-      <div class="control-deck__hint">
-        <p><strong>Phase 5</strong> replaces this connection form with the live command deck (pause simulation, change environment, trigger event, reset user position).</p>
+        <div class="audio-controls focus-view__audio">
+          <button type="button" id="speaker-toggle" class="toggle-btn" aria-pressed="false" data-muted="false">
+            <span class="toggle-btn__dot" aria-hidden="true"></span>
+            <span class="toggle-btn__label">Speaker on</span>
+          </button>
+          <button type="button" id="mic-toggle" class="toggle-btn" aria-pressed="false" data-muted="false" disabled>
+            <span class="toggle-btn__dot" aria-hidden="true"></span>
+            <span class="toggle-btn__label">Mic on</span>
+          </button>
+          <label class="volume-control">
+            <span class="volume-control__label">Volume</span>
+            <input type="range" id="volume-slider" min="0" max="100" value="100">
+            <span class="volume-control__value" id="volume-value">100</span>
+          </label>
+        </div>
       </div>
-    </aside>
+
+      <aside class="focus-view__panel">
+        <div class="focus-view__meta">
+          <h2 id="focus-scenario" class="focus-view__scenario">Scenario</h2>
+          <p id="focus-trainee" class="focus-view__trainee">Trainee</p>
+          <p class="focus-view__chips">
+            <span class="chip" id="focus-code">code —</span>
+            <span class="chip" id="focus-duration">0:00</span>
+            <span class="chip" id="focus-source">—</span>
+          </p>
+        </div>
+
+        <div class="command-deck">
+          <h3 class="command-deck__title">Commands</h3>
+
+          <button type="button" class="command-btn" data-command="pause_simulation" data-value="true">
+            <span class="command-btn__label">Pause simulation</span>
+            <span class="command-btn__hint">pause_simulation:true</span>
+          </button>
+          <button type="button" class="command-btn" data-command="pause_simulation" data-value="false">
+            <span class="command-btn__label">Resume simulation</span>
+            <span class="command-btn__hint">pause_simulation:false</span>
+          </button>
+          <button type="button" class="command-btn" data-command="reset_user_position">
+            <span class="command-btn__label">Reset position</span>
+            <span class="command-btn__hint">reset_user_position</span>
+          </button>
+
+          <div class="command-form">
+            <label class="field">
+              <span class="field__label">Change environment (map name)</span>
+              <input type="text" id="map-name-input" spellcheck="false" placeholder="HubLevel">
+            </label>
+            <button type="button" class="command-btn" data-command="change_environment">
+              <span class="command-btn__label">Change environment</span>
+              <span class="command-btn__hint">change_environment</span>
+            </button>
+          </div>
+
+          <div class="command-form">
+            <label class="field">
+              <span class="field__label">Trigger event (event type)</span>
+              <input type="text" id="event-type-input" spellcheck="false" placeholder="fire_outbreak">
+            </label>
+            <button type="button" class="command-btn" data-command="trigger_event">
+              <span class="command-btn__label">Trigger event</span>
+              <span class="command-btn__hint">trigger_event</span>
+            </button>
+          </div>
+
+          <div id="command-log" class="command-log" aria-live="polite"></div>
+        </div>
+      </aside>
+    </section>
+
   </main>
 
-  <!-- Agora Web SDK — pinned via the CDN filename. Loaded as a classic script
-       so AgoraRTC is on window before main.js (a deferred ES module) runs. -->
   <script src="https://download.agora.io/sdk/release/AgoraRTC_N-4.20.0.js"></script>
-  <script type="module" src="./js/main.js"></script>
+  <script src="/socket.io/socket.io.js"></script>
+  <script type="module" src="./js/grid.js"></script>
 </body>
 </html>

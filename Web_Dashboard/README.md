@@ -18,100 +18,113 @@ Web_Dashboard/
 ├── docs/
 │   └── commands.md           # canonical instructor → headset command schema
 └── public/                   # static assets — works without the server too
-    ├── index.html
+    ├── index.html            # OneBonsai grid view (Phase 4.5)
+    ├── single.html           # legacy single-session debug view (Step 1.5)
+    ├── faker.html            # synthetic VR sessions for testing
     ├── css/
     │   ├── tokens.css
     │   └── style.css
     └── js/
-        └── main.js
+        ├── grid.js           # multi-session grid client (index.html)
+        ├── single.js         # single-session client (single.html)
+        └── faker.js          # canvas-published faker (faker.html)
 ```
 
-## Two operating modes
+## Three pages, three purposes
 
-### Mode A — Static MVP (Step 1, working today)
+| Page | Purpose | Needs server? |
+|---|---|---|
+| `/` (`index.html`) | OneBonsai grid view — 3×2 tiles of live sessions per tenant, click to expand into focus mode with the §5.2 command deck. The product. | **Yes** |
+| `/single.html` | Legacy single-session debug view from Step 1.5. Useful as a known-good fallback when poking the receive path. | No (Mode A) |
+| `/faker.html` | Synthetic VR sessions for testing the grid without N physical headsets. Canvas-published video, no webcam permission needed. Spawn many via `/faker.html?spawn=N`. | **Yes** |
 
-The minimum-viable self-hosted replacement for the Agora basic video call
-demo. No Node, no token minting, no pairing — just serve `public/` as
-static files and paste credentials into the on-page form.
-
-```bash
-# From the repo root
-npx serve Web_Dashboard/public
-# or
-python -m http.server 8000 --directory Web_Dashboard/public
-```
-
-Open the printed URL, paste the same `appId`, `channel`, and 24-hour
-temporary token that are currently baked into `BP_VRPawn`, click **Join**.
-The trainee POV appears as soon as the headset publishes its first frame.
-
-### Mode B — Phase 4 server (this commit, scaffolded but not yet wired into the SPA)
-
-The real architecture: Express + Socket.IO + server-minted short-lived
-tokens + 4-digit code pairing. The SPA is **not yet** wired to call this
-server — that's the next discrete unit of work after Quest verification.
-
-#### One-time setup
+## One-time setup
 
 1. Install Node.js 20 or newer.
-2. Install deps:
+2. Install deps (from `Web_Dashboard/`):
    ```bash
-   # From Web_Dashboard/
    npm install
    ```
 3. Copy `.env.example` to `.env` and fill in:
    - `AGORA_APP_ID` — from <https://console.agora.io> > Project Management.
-   - `AGORA_APP_CERTIFICATE` — same page, "primary certificate". This is a
-     hard secret; never expose to the client.
-   - `AGORA_TOKEN_TTL_SECONDS` — leave at the default (1800 = 30 min) unless
-     you have a specific reason to change it.
-   - `PORT` — HTTP port for Express + Socket.IO (default 3000).
-   - `DEFAULT_TENANT_ID` — leave as `default` for v1.
+   - `AGORA_APP_CERTIFICATE` — same page, "primary certificate". Hard secret.
+   - `AGORA_TOKEN_TTL_SECONDS` — leave at the default (1800 = 30 min).
+   - `PORT` — HTTP port (default 3000).
+   - `DEFAULT_TENANT_ID` — set to `onebonsai` for the dogfooding demo.
 
-#### Run
+## Run
 
 ```bash
-# From Web_Dashboard/
-npm start              # production-style: one boot, no hot reload
-# or
 npm run dev            # node --watch — auto-restarts on file change
+# or
+npm start              # production-style: one boot, no hot reload
 ```
 
-The server logs the listen URL, the static assets directory, and whether
-Agora creds are wired up. Open the listen URL — the existing static SPA
-(Mode A) is served from `/`, plus the server adds:
+Open `http://localhost:3000`. The grid view loads, empty until something
+registers. Click **Spawn demo sessions** in the header (or open
+`/faker.html?spawn=5` directly) to populate it.
+
+## Test the OneBonsai grid end-to-end (~2 minutes)
+
+1. **Start the server**: `npm run dev`.
+2. **Open the grid**: `http://localhost:3000`. Header should show
+   `Live · tenant onebonsai`.
+3. **Spawn fakers**: click the "Spawn demo sessions" button in the
+   header → 5 popup windows open, each registers a synthetic session
+   and starts publishing a canvas video. Within ~2 seconds the grid
+   populates with 5 tiles ("Fire Training — Trainee 47", etc.).
+4. **Click a tile**: the grid hides, the chosen tile fills the stage,
+   the right-hand command deck appears.
+5. **Send a command**: click **Pause simulation**. The faker overlays
+   a yellow "PAUSE" badge for 2.5 seconds, then a sticky "PAUSED"
+   black overlay. **Resume simulation** clears it.
+6. **Back to grid**: click `‹ Back to grid` → the focused tile tears
+   down and the grid re-subscribes to the current page.
+
+To get a real Quest into the grid, see
+[`Devlog.md` §2026-06-03 multi-session BP wiring](../Devlog.md) for the
+per-device channel rename recipe.
+
+## API + Socket.IO surface
 
 | Surface | Direction | Purpose |
 |---|---|---|
-| `POST /api/token` | client → server | Mints a short-lived RTC token. Body: `{ code, role, uid? }`. Requires the pairing code to already be registered by a headset (no rando minting). |
 | `GET /api/health` | any → server | Liveness probe. Returns `{ ok, uptime }`. |
-| Socket.IO `headset:register` | headset → server | Headset claims a 4-digit pairing code. Payload `{ code, tenantId? }`. |
-| Socket.IO `instructor:join` | instructor → server | Instructor enters the 4-digit code. Payload `{ code }`. |
-| Socket.IO `session:status` | server → both peers | Broadcast `{ state: 'waiting' \| 'connected' \| 'reconnecting' }`. |
-| Socket.IO `instructor:command` | instructor → server | Dispatch a §5.2 command. Validated server-side. |
+| `GET /api/config` | client → server | Safe-to-expose client config: `{ appId, defaultTenantId }`. |
+| `GET /api/sessions?tenantId=X&page=N&pageSize=M` | client → server | Paginated list of active sessions for a tenant. |
+| `POST /api/token` | client → server | Mints a short-lived RTC token. Body: `{ code, role, uid? }`. Requires the pairing code to already be registered by a headset (no rando minting). |
+| Socket.IO `headset:register` | headset → server | Headset (or faker) claims a 4-digit code. Payload: `{ code, tenantId, scenario?, traineeName?, source? }`. |
+| Socket.IO `instructor:subscribe-tenant` | instructor → server | Grid-view subscription: receive all sessions for a tenant + live `sessions:changed` updates. Payload: `{ tenantId }`, acks with the initial session list. |
+| Socket.IO `instructor:join` | instructor → server | Legacy 1:1 pairing for single-session debug view. Payload: `{ code }`. |
+| Socket.IO `instructor:command` | instructor → server | Dispatch a §5.2 command. Payload includes `code` to target a specific session in the grid view. Validated server-side. |
 | Socket.IO `headset:command` | server → headset | Validated command relayed to the headset socket. |
+| Socket.IO `session:status` | server → both peers in a code | Broadcast `{ state: 'waiting' \| 'connected' \| 'reconnecting' }`. |
+| Socket.IO `sessions:changed` | server → instructor sockets | Tenant-scoped broadcast: full updated session list. Fires on headset register/disconnect. |
 
 See `docs/commands.md` for the canonical command schema enforced by
 `src/commands.js`.
 
-## What's still missing (intentionally, for separate commits)
+## Real headset wiring (still pending)
 
-| Item | Why deferred |
-|---|---|
-| **SPA wiring to the server** — replace the manual `token` field with a `code` field, call `POST /api/token` after `instructor:join`, then join Agora. | Kept as a separate change so the Mode A MVP keeps working independently of server availability during the transition. |
-| **Headset wiring to the server** — UE Socket.IO plugin install + a `USignalingSubsystem` (UGameInstanceSubsystem) wrapping `headset:register` + token fetch + `headset:command` dispatch. | Pulls in a third-party UE plugin and a new C++ subsystem; deserves its own dedicated session per `.cursorrules §4.2`. |
-| **Phase 5 instructor command deck** — replace the connection form in the right panel with the four §5.2 command controls. | Depends on the SPA wiring above. |
+The Quest / Pico builds currently bake an Agora App ID + a 24-hour
+temporary token + a hardcoded channel name into `BP_VRPawn`. To put
+real headsets on the OneBonsai grid alongside the fakers:
+
+| Option | Effort | What it gets you |
+|---|---|---|
+| **Q1 — Per-device channel rename** | ~10 min per device | Build the APK once per device with the channel renamed to `t-onebonsai-XXXX` and a matching temp token. Quick demo path. |
+| **Q2 — UE Socket.IO subsystem** | 1–2 sessions | Install a UE Socket.IO plugin, scaffold `USignalingSubsystem` that emits `headset:register` + fetches tokens from `/api/token` at launch. Architectural endpoint. |
+
+See `Devlog.md` for the click-paths and shell commands.
 
 ## Conventions
 
 - **ESM only** (`"type": "module"`, `import`/`export`).
-- **No build step** for the client — vanilla JS + CSS served as-is. The
-  server (`server.js`) and modules under `src/` are plain Node ESM.
+- **No build step** for the client — vanilla JS + CSS served as-is.
 - **No secrets in client code.** Even `AGORA_APP_ID`, which is technically
   safe to expose, is kept server-side so rotation is one place.
 - **All Socket.IO payloads are JSON-validated server-side** before any
   forwarding (per `.cursorrules §4.3`).
 - **Per-channel token binding only.** Reusing a token across channel names
   crashes the Agora native SDK with an `ACCESS_VIOLATION` deep in libaosl
-  (see `Devlog.md` 2026-06-01 Phase 2 entry — the lesson that motivates
-  the always-mint-per-channel rule in `src/agora.js`).
+  (see `Devlog.md` 2026-06-01 Phase 2 entry).

@@ -1,0 +1,103 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>OneBonsai — Session Faker</title>
+  <link rel="stylesheet" href="./css/tokens.css">
+  <link rel="stylesheet" href="./css/style.css">
+</head>
+<body>
+  <header class="app-header">
+    <h1 class="app-header__title">OneBonsai — Session Faker</h1>
+    <span class="app-header__subtitle">Synthetic VR sessions for grid-view testing</span>
+  </header>
+
+  <main class="faker">
+    <!-- ===== Single-faker mode ===== -->
+    <!-- When opened with ?spawn=N this whole section is hidden and N popups
+         are launched instead (see launcher below). When opened plain, this
+         section runs as a single faker that publishes a canvas video to the
+         tenant's grid. -->
+    <section class="faker__panel" id="single-mode">
+      <h2 class="faker__title">Single Faker</h2>
+      <p class="faker__hint">
+        Registers as a fake headset, publishes a canvas-generated video to
+        <code>t-&lt;tenant&gt;-&lt;code&gt;</code>, and prints any incoming commands
+        back into the canvas so you can verify the round-trip.
+      </p>
+
+      <form id="faker-form" class="form" autocomplete="off">
+        <div class="form__row">
+          <label class="field">
+            <span class="field__label">Tenant ID</span>
+            <input type="text" id="tenant-input" required spellcheck="false" value="onebonsai">
+          </label>
+          <label class="field">
+            <span class="field__label">4-digit code</span>
+            <input type="text" id="code-input" required spellcheck="false" maxlength="4" pattern="\d{4}" placeholder="auto">
+          </label>
+        </div>
+        <div class="form__row">
+          <label class="field">
+            <span class="field__label">Scenario</span>
+            <input type="text" id="scenario-input" required spellcheck="false" value="Fire Training">
+          </label>
+          <label class="field">
+            <span class="field__label">Trainee name</span>
+            <input type="text" id="trainee-input" required spellcheck="false" value="Trainee 47">
+          </label>
+        </div>
+
+        <label class="field field--inline">
+          <input type="checkbox" id="stub-mode">
+          <span>
+            <strong>Stub mode</strong> — register session metadata but don't publish video.
+            Use when a real headset (Quest / Pico) is the actual video source on this code,
+            and you only need the grid to know about the session.
+          </span>
+        </label>
+
+        <div class="form__actions">
+          <button type="submit" id="start-btn" class="btn btn--primary">Start session</button>
+          <button type="button" id="stop-btn" class="btn btn--secondary" disabled>Stop</button>
+        </div>
+      </form>
+
+      <div class="faker__status" aria-live="polite">
+        <span id="status-text" class="status status--idle">Idle</span>
+      </div>
+
+      <div class="faker__preview">
+        <canvas id="preview-canvas" width="640" height="360"></canvas>
+        <p class="faker__preview-hint">
+          Live preview of what the grid view sees as this session's video tile.
+        </p>
+      </div>
+    </section>
+
+    <!-- ===== Launcher ===== -->
+    <section class="faker__panel" id="launcher">
+      <h2 class="faker__title">Spawn Multiple Sessions</h2>
+      <p class="faker__hint">
+        Opens N popups (each a single faker in its own browser context) with
+        pre-canned OneBonsai scenarios. Use this to populate the grid view
+        for demos. Browsers may ask permission to open popups the first time.
+      </p>
+      <div class="form__actions">
+        <button type="button" class="btn btn--primary" data-spawn="3">Spawn 3 sessions</button>
+        <button type="button" class="btn btn--primary" data-spawn="5">Spawn 5 sessions</button>
+        <button type="button" class="btn btn--primary" data-spawn="8">Spawn 8 sessions</button>
+      </div>
+      <p class="faker__hint">
+        Tip: each popup uses its own 4-digit code and is independent. Close any
+        popup to drop that session from the grid.
+      </p>
+    </section>
+  </main>
+
+  <script src="https://download.agora.io/sdk/release/AgoraRTC_N-4.20.0.js"></script>
+  <script src="/socket.io/socket.io.js"></script>
+  <script type="module" src="./js/faker.js"></script>
+</body>
+</html>

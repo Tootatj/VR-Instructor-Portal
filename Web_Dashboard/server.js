@@ -12,7 +12,7 @@ import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
 import { mintToken, channelNameFor } from './src/agora.js';
-import { lookupRoom, registerPairingHandlers } from './src/pairing.js';
+import { lookupRoom, listSessionsForTenant, registerPairingHandlers } from './src/pairing.js';
 import { registerCommandHandlers } from './src/commands.js';
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
@@ -54,6 +54,42 @@ app.post('/api/token', (req, res) => {
     console.error('[VRIP] /api/token failed', err);
     res.status(500).json({ error: err.message ?? 'token mint failed' });
   }
+});
+
+// --- API: client config (safe-to-expose subset) ----------------------------
+// The faker and grid view both need the App ID (client-side, sent to Agora
+// SD-RTN anyway) and the default tenant. Returning them via API beats baking
+// them into static HTML — one .env file controls everything.
+app.get('/api/config', (_req, res) => {
+  res.json({
+    appId: process.env.AGORA_APP_ID ?? null,
+    defaultTenantId: process.env.DEFAULT_TENANT_ID ?? 'onebonsai',
+  });
+});
+
+// --- API: sessions discovery (grid view) -----------------------------------
+// GET /api/sessions?tenantId=onebonsai&page=1&pageSize=6
+//   → { tenantId, page, pageSize, total, totalPages, sessions: [...] }
+//
+// Sessions list is also pushed live to subscribed instructor sockets via
+// the `sessions:changed` Socket.IO event (see pairing.js); this REST
+// endpoint is the page-load entry point and the fallback for clients that
+// haven't established a socket yet.
+app.get('/api/sessions', (req, res) => {
+  const tenantId = (req.query.tenantId ?? process.env.DEFAULT_TENANT_ID ?? 'onebonsai').toString();
+  const page = Math.max(1, Number(req.query.page) || 1);
+  const pageSize = Math.min(50, Math.max(1, Number(req.query.pageSize) || 6));
+  const all = listSessionsForTenant(tenantId);
+  const totalPages = Math.max(1, Math.ceil(all.length / pageSize));
+  const offset = (page - 1) * pageSize;
+  res.json({
+    tenantId,
+    page,
+    pageSize,
+    total: all.length,
+    totalPages,
+    sessions: all.slice(offset, offset + pageSize),
+  });
 });
 
 // --- API: health -----------------------------------------------------------
