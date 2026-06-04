@@ -182,28 +182,66 @@ void USignalingSubsystem::RefreshTenantFromRegistry()
 
 void USignalingSubsystem::HandleRegistrationChanged()
 {
-    UE_LOG(LogVRIPSignaling, Log, TEXT("HandleRegistrationChanged: registry changed, re-resolving tenant"));
+    UTenantRegistry* Registry = GetGameInstance()
+        ? GetGameInstance()->GetSubsystem<UTenantRegistry>()
+        : nullptr;
+    const bool bNowRegistered = Registry && Registry->IsRegistered();
 
+    UE_LOG(LogVRIPSignaling, Log,
+        TEXT("HandleRegistrationChanged: registry now registered=%d (previous tenant=%s)"),
+        bNowRegistered ? 1 : 0, *TenantId);
+
+    // Path A — user just unregistered (ClearRegistration was called).
+    // Disconnect and STAY disconnected. Do NOT reconnect under the INI
+    // fallback tenant — that would silently leak the device into the dev
+    // tenant's dashboard grid, which is the exact behaviour the
+    // registration gate was built to prevent. The device is in limbo
+    // until the next successful RedeemCode fires OnRegistrationChanged
+    // again (Path B below).
+    if (!bNowRegistered)
+    {
+        UE_LOG(LogVRIPSignaling, Log,
+            TEXT("HandleRegistrationChanged: now unregistered — disconnecting socket + clearing credentials"));
+        EmitHeadsetEnd();
+        if (Socket)
+        {
+            Socket->SyncDisconnect();
+            Socket = nullptr;
+        }
+        if (UWorld* World = GetWorld())
+        {
+            World->GetTimerManager().ClearTimer(TokenRefreshTimer);
+        }
+        TenantId.Reset();
+        AgoraToken.Reset();
+        AgoraChannel.Reset();
+        AgoraUid = 0;
+        // PairingCode kept — it's already random per cold launch and
+        // doesn't leak anything. A re-register will reuse it.
+        SetState(ESignalingState::Disconnected);
+        return;
+    }
+
+    // From here on bNowRegistered == true. Resolve the new tenant value
+    // (may or may not differ from the current one).
     const FString OldTenant = TenantId;
     RefreshTenantFromRegistry();
 
-    // First-time registration: socket isn't open yet (we were waiting
-    // for this exact event). Open it now with the freshly resolved
-    // tenant.
+    // Path B — first-time registration (or re-registration after an
+    // earlier Unregister). Socket was torn down in Path A or never
+    // opened in strict-mode boot. Open it now under the new tenant.
     if (!Socket)
     {
         UE_LOG(LogVRIPSignaling, Log,
-            TEXT("HandleRegistrationChanged: socket not yet open, opening now with tenant=%s"),
+            TEXT("HandleRegistrationChanged: opening socket for tenant=%s"),
             *TenantId);
         OpenSocket();
         return;
     }
 
-    // Tenant actually changed at runtime (e.g. "Switch organisation"
-    // pause-menu flow): tear down and reopen with the new tenant.
-    // EmitHeadsetEnd cleans up the previous tenant's session; the
-    // socket disconnect + reconnect will re-register cleanly under
-    // the new tenant.
+    // Path C — switch-org in one step (registered tenant A, redeem code
+    // for tenant B without an intervening Unregister). Tear down + reopen
+    // under the new tenant.
     if (OldTenant != TenantId)
     {
         UE_LOG(LogVRIPSignaling, Log,
@@ -213,7 +251,12 @@ void USignalingSubsystem::HandleRegistrationChanged()
         Socket->SyncDisconnect();
         Socket = nullptr;
         OpenSocket();
+        return;
     }
+
+    // Path D — defensive no-op (same tenant, socket still open).
+    UE_LOG(LogVRIPSignaling, Verbose,
+        TEXT("HandleRegistrationChanged: no-op (same tenant, socket still open)"));
 }
 
 void USignalingSubsystem::GeneratePairingCode()
