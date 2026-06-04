@@ -12,6 +12,8 @@
 //     with a code) and receive `sessions:changed` broadcasts. The legacy
 //     1:1 `instructor:join` path stays for single-session debug.
 
+import { isKnownTenant } from './tenants.js';
+
 const CODE_PATTERN = /^\d{4}$/;
 const TENANT_PATTERN = /^[a-zA-Z0-9_-]{1,32}$/;
 
@@ -79,6 +81,18 @@ export function registerPairingHandlers(io) {
       const tenantId = payload?.tenantId ?? process.env.DEFAULT_TENANT_ID ?? 'onebonsai';
       if (!TENANT_PATTERN.test(tenantId)) {
         ack?.({ ok: false, error: 'invalid tenantId' });
+        return;
+      }
+      // Phase 6 (Devlog 2026-06-04): defence-in-depth — the headset can
+      // technically send any tenantId in `headset:register`, but only
+      // tenants that exist in the registry (i.e. some real OneBonsai-
+      // issued code resolved to them) are accepted. Stops a misbehaving
+      // or rogue device from creating sessions in arbitrary tenant
+      // namespaces. The legacy faker tool keeps working because it uses
+      // DEFAULT_TENANT_ID which IS in the registry (data/tenant-codes.json).
+      if (!isKnownTenant(tenantId)) {
+        ack?.({ ok: false, error: `unknown tenant "${tenantId}" — not in registry` });
+        console.warn(`[VRIP] headset:register rejected: tenant=${tenantId} not in registry sock=${socket.id}`);
         return;
       }
 
@@ -168,13 +182,27 @@ export function registerPairingHandlers(io) {
     // receive live sessions:changed updates, and dispatch commands to any
     // specific session by passing { code, ... } in instructor:command.
     socket.on('instructor:subscribe-tenant', (payload, ack) => {
-      const tenantId = payload?.tenantId;
+      // Phase 6 (Devlog 2026-06-04): instructor sockets MUST present a
+      // valid session cookie (attached by auth.js Socket.IO middleware
+      // on handshake). The tenantId in the payload is ignored — only
+      // the cookie's tenantId is authoritative. This closes the gap
+      // where a logged-in Securitas instructor could otherwise emit
+      // `instructor:subscribe-tenant { tenantId: "customerx" }` over
+      // the socket and bypass the REST auth.
+      const instructor = socket.data.instructor;
+      if (!instructor) {
+        ack?.({ ok: false, error: 'instructor login required' });
+        return;
+      }
+      const tenantId = instructor.tenantId;
       if (!TENANT_PATTERN.test(tenantId ?? '')) {
-        ack?.({ ok: false, error: 'invalid tenantId' });
+        ack?.({ ok: false, error: 'invalid tenantId in session' });
         return;
       }
 
-      // Leave any previous tenant room (instructor may switch companies).
+      // Leave any previous tenant room (cookie could rotate mid-socket
+      // if the user logs out + back in to a different tenant in the
+      // same tab — unlikely, but cheap to handle).
       if (socket.data.tenantId && socket.data.tenantId !== tenantId) {
         socket.leave(tenantRoomName(socket.data.tenantId));
       }
@@ -183,7 +211,10 @@ export function registerPairingHandlers(io) {
       socket.data.tenantId = tenantId;
       socket.join(tenantRoomName(tenantId));
 
-      console.log(`[VRIP] instructor:subscribe-tenant tenant=${tenantId} sock=${socket.id}`);
+      console.log(
+        `[VRIP] instructor:subscribe-tenant tenant=${tenantId} ` +
+        `instructor="${instructor.displayName}" sock=${socket.id}`
+      );
 
       ack?.({
         ok: true,

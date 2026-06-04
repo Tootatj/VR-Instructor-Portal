@@ -668,6 +668,48 @@ The two layers compose cleanly. The OPC determines *which tenant* the headset be
 
 **Things to keep stable across Phase 6.** Don't break the existing `t-<tenantId>-<pairingCode>` channel naming convention — it's load-bearing across server, BP, and (after the persistence change) the registration redemption response. The `USignalingSubsystem` public API surface (the 4 BP-readable credentials + 4 delegates + the state machine) should also stay stable — that's what makes the layer drop-in portable per `HowToPort.md`. Phase 6 is internal plumbing (where does `TenantId` come from at boot) plus deployment hardening, not an API redesign.
 
+### 2026-06-04 — Phase 6 Phases A/B/C: server-side multi-tenant layer
+
+Implemented the server half of the single-code multi-tenant model sketched out in the scope-revision entry above. **Significant simplification confirmed during planning:** the user's vision is *one* code per tenant (e.g. `5555555555` → Securitas), used for **both** VR device registration (one-time first-launch) and instructor dashboard login. No separate instructor login codes, no per-instructor accounts — anonymous instructors with an optional display name ("Jan is watching") are enough. Cuts the auth surface significantly versus an OAuth-flavoured per-instructor design.
+
+**What landed (the entire dashboard server is now multi-tenant-aware, with no VR-side changes yet).**
+
+- **`Web_Dashboard/data/tenant-codes.json`** — static lookup table mapping codes to `{ tenantId, displayName }`. Three demo tenants seeded: OneBonsai (code `0000000000`), Securitas (`5555555555`), CustomerX (`7777777777`). **Designed to be replaced wholesale with an HTTP call to OneBonsai's existing client-management portal once it exposes an API** — the JSON file *is* the contract spec for that integration. Swap the body of `resolveByCode()` in `src/tenants.js`, leave every consumer untouched.
+
+- **`Web_Dashboard/src/tenants.js`** — `resolveByCode(code) → {tenantId,displayName}|null`, `getTenantInfo(tenantId)`, `isKnownTenant(tenantId)`. Validates the JSON at boot (logs the loaded tenant list — `[VRIP tenants] loaded 3 tenant code(s): onebonsai, securitas, customerx`). Codes normalised to lowercase + trim; pattern is alphanumeric 4-32 chars but digit-only is preferred (the VR text-entry widget defaults to numeric keyboard, which is much faster on a controller than the alphanumeric one).
+
+- **`Web_Dashboard/src/auth.js`** — signed-cookie sessions (HMAC-SHA256 over a base64url JSON payload). **Deliberately zero new dependencies** — the whole flow is ~50 lines vs pulling in `cookie-parser` + `express-session` + a session store + `jsonwebtoken`. Includes Express middleware (`attachInstructor`, `requireInstructor`) and a Socket.IO equivalent (`attachInstructorToSocket`). Dev fallback: if `INSTRUCTOR_SESSION_SECRET` isn't in `.env`, a per-process ephemeral random secret is generated — login works, but every server restart invalidates all sessions. The startup log loudly warns about this.
+
+- **`server.js` — four new endpoints + auth gate on existing ones:**
+
+  | Endpoint | Auth | Purpose |
+  |---|---|---|
+  | `POST /api/tenant/resolve` | none (code is the credential) | VR side — first-launch code → `{tenantId, displayName}` |
+  | `POST /api/instructor/login` | none | Same code + optional name → sets `vrip_instructor` cookie |
+  | `POST /api/instructor/logout` | none | Clears cookie |
+  | `GET /api/instructor/me` | cookie required | Dashboard boot uses this to discover its tenant + render header |
+  | `GET /api/sessions` | cookie required | Tenant taken from cookie, `?tenantId=X` query removed |
+  | `GET /` | cookie required | Redirects to `/login.html` if no session |
+
+- **`public/login.html` + `js/login.js` + CSS additions** — clean dark-themed login card matching the existing design tokens; centered single-code input field (monospace, big, letter-spaced — looks like a 2FA prompt). Remembers the instructor's *name* (not the code) in localStorage for convenience.
+
+- **`public/index.html` + `js/grid.js` updates** — header now shows an `instructor-chip` with `Tenant · Name` plus a Sign Out button. Boot fetches `/api/instructor/me` instead of `/api/config.defaultTenantId`; 401 hard-redirects to login. Socket.IO connects `withCredentials: true` so the cookie travels on the handshake.
+
+- **`src/pairing.js` — two security tightenings:**
+  1. `headset:register` now rejects any `tenantId` not in the registry (defence-in-depth — a misbehaving headset can't create sessions in arbitrary tenant namespaces by tampering its register payload).
+  2. `instructor:subscribe-tenant` **ignores the payload's `tenantId` entirely** and uses the cookie's tenantId. Closes the gap where a logged-in Securitas instructor could otherwise emit `instructor:subscribe-tenant { tenantId: "customerx" }` over the socket and bypass the REST auth.
+
+**Validation.** Wrote `scripts/smoke-phase6.ps1` covering all 11 endpoint × auth state combinations. All pass. Browser-validated end-to-end by the user: log in as Securitas, hit `http://localhost:3000/api/sessions?tenantId=customerx` directly in the address bar → response correctly reports `"tenantId":"securitas"` (cookie wins, URL parameter silently ignored). Multi-tenant isolation is real, not theatrical.
+
+**Two things in the original scope-revision entry that turned out to be wrong / simpler.**
+
+1. The original plan (the "two stacked codes" table above) imagined a separate OPC layer issued by OneBonsai's portal. User clarified: it's *one* code per tenant, used for both VR + instructor. Phase 6A reflects this — no separate "OPC" type, just a single `code → tenant` lookup. If OneBonsai's portal already has the same shape (one code per tenant), the future integration is literally a one-line `fetch()` swap inside `resolveByCode()`.
+2. The original effort estimate had "~3-5 days: server hardening (auth + CORS + TLS + DB)" as a single bucket. The cookie-auth layer alone was a few hours, not days, because we skipped the per-instructor account model. CORS, TLS, and persistent DB are still TODO but they're each independent and small.
+
+**What this means for portability into OneBonsai's existing VR apps.** The user noted those apps already have a VR panel for entering registration codes (built for the existing company-management system). Phase 6D will be designed with that in mind: the `UTenantRegistry` C++ subsystem owns all logic (HTTP + persistence + state), exposes `RedeemCode(FString) → callback` as the entire BP-callable surface, and the `WBP_RegistrationGate` UMG widget we ship is *optional* — host apps wire their existing panel's Submit button straight into `TenantRegistry->RedeemCode(InputText)` and bind `OnRegistrationChanged` to hide their panel. To be documented in `HowToPort.md` under a "BYO code-input UI" section once Phase 6D lands.
+
+**Next:** Phase 6D (the VR half) — `UTenantRegistry` GameInstanceSubsystem with `RedeemCode/IsRegistered/GetTenantId/ClearRegistration`, persistence to `Saved/Config/OneBonsaiRegistration.json`, hook into `BeginPlay`, swap `USignalingSubsystem::LoadConfig` to read from registry. ~1 day estimated; will conclude with a 2-device test (Quest registers as Securitas, Pico as CustomerX, two instructor logins see fully separated grids).
+
 ### Open Backlog Items
 
 - **Phase 4 Phases C–D — final BP integration:** (1) `WBP_PairingHUD` UMG widget showing the pairing code + connection state, added to viewport from BeginPlay; (2) `OnHeadsetCommand` bound graph on `BP_VRPawn` that switches on `Command` and fires per-command BP events (`pause_simulation` toggles `Set Game Paused`; others log to HUD).

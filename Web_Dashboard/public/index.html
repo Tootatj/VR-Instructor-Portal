@@ -15,6 +15,14 @@
     </div>
     <div class="app-header__actions">
       <span id="conn-indicator" class="status status--idle">Connecting…</span>
+      <span id="instructor-chip" class="instructor-chip" hidden>
+        <span class="instructor-chip__tenant" id="instructor-tenant">—</span>
+        <span class="instructor-chip__sep">·</span>
+        <span class="instructor-chip__name" id="instructor-name">—</span>
+      </span>
+      <button id="logout-btn" type="button" class="btn btn--secondary btn--sm" hidden>
+        Sign out
+      </button>
       <a href="/faker.html?spawn=5" target="_blank" rel="noopener" class="btn btn--secondary btn--sm">
         Spawn demo sessions
       </a>

@@ -1,0 +1,8 @@
+{
+  "_comment_format": "Each key is a tenant-registration code (also the instructor-login code). Same code is typed by the trainee on first launch of the VR app (binds the device to a tenant forever) AND by the instructor on the dashboard login screen. Codes are matched case-insensitively; the JSON keys must be lowercase. Replace this static file with an HTTP call to the OneBonsai client-management portal once it exposes an API (see Devlog 2026-06-04 Phase 6 scope revision).",
+  "_comment_demo": "Three demo entries below — feel free to add more tenants for testing. The 'displayName' is shown in the dashboard header and the VR registration confirmation widget.",
+
+  "0000000000": { "tenantId": "onebonsai", "displayName": "OneBonsai (Demo)" },
+  "5555555555": { "tenantId": "securitas", "displayName": "Securitas Training" },
+  "7777777777": { "tenantId": "customerx", "displayName": "Customer X Training" }
+}

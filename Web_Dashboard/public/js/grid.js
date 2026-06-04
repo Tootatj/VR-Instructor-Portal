@@ -38,6 +38,11 @@ const prevBtn          = document.getElementById('prev-page-btn');
 const nextBtn          = document.getElementById('next-page-btn');
 const pageIndicator    = document.getElementById('page-indicator');
 
+const instructorChip   = document.getElementById('instructor-chip');
+const instructorTenant = document.getElementById('instructor-tenant');
+const instructorName   = document.getElementById('instructor-name');
+const logoutBtn        = document.getElementById('logout-btn');
+
 const gridView         = document.getElementById('grid-view');
 const focusView        = document.getElementById('focus-view');
 const focusVideoMount  = document.getElementById('focus-video');
@@ -64,28 +69,58 @@ boot().catch((err) => {
 
 async function boot() {
   setConn('connecting', 'Loading config…');
+
+  // Phase 6 (Devlog 2026-06-04): tenant scope comes from the instructor
+  // session cookie, not from /api/config. The server's auth gate already
+  // redirected anonymous users to /login.html, but if our cookie expired
+  // mid-session (or we landed here via back-button after logout) /api/me
+  // will 401 and we hard-redirect.
+  const meRes = await fetch('/api/instructor/me', { credentials: 'same-origin' });
+  if (meRes.status === 401) {
+    window.location.replace('/login.html');
+    return;
+  }
+  if (!meRes.ok) {
+    setConn('error', `/api/instructor/me failed (${meRes.status})`);
+    return;
+  }
+  const me = await meRes.json();
+  state.tenantId = me.tenantId;
+  renderInstructorChip(me);
+  wireLogout();
+
+  // Agora App ID is still public-ish config (it gets sent to Agora SD-RTN
+  // on join anyway); keep using /api/config for that single value.
   const cfg = await fetch('/api/config').then(r => r.json());
   state.appId = cfg.appId;
-  state.tenantId = cfg.defaultTenantId;
   if (!state.appId) {
     setConn('error', 'AGORA_APP_ID missing on server (.env)');
     return;
   }
 
   // Initial sessions list via REST (works even before socket connects).
+  // No tenantId in the URL — the server reads it from the session cookie.
   const initial = await fetch(
-    `/api/sessions?tenantId=${encodeURIComponent(state.tenantId)}&page=1&pageSize=999`
+    `/api/sessions?page=1&pageSize=999`,
+    { credentials: 'same-origin' }
   ).then(r => r.json());
   state.sessions = initial.sessions ?? [];
 
-  // Then connect Socket.IO for live updates.
+  // Then connect Socket.IO for live updates. The session cookie travels
+  // automatically on the handshake (same-origin), so the server's
+  // io.use(attachInstructorToSocket) hook reads it and the subscribe
+  // handler can ignore any tenantId the client tries to send.
   setConn('connecting', 'Connecting to signaling…');
-  const socket = io({ path: '/socket.io' });
+  const socket = io({ path: '/socket.io', withCredentials: true });
   socket.on('connect', async () => {
-    const ack = await emitWithAck(socket, 'instructor:subscribe-tenant', {
-      tenantId: state.tenantId,
-    });
+    const ack = await emitWithAck(socket, 'instructor:subscribe-tenant', {});
     if (!ack?.ok) {
+      // 401-equivalent: cookie expired/invalid on the socket — kick to
+      // login so the next reconnect picks up a fresh session.
+      if (ack?.error === 'instructor login required') {
+        window.location.replace('/login.html');
+        return;
+      }
       setConn('error', `subscribe failed: ${ack?.error ?? 'unknown'}`);
       return;
     }
@@ -521,6 +556,32 @@ function logCommand(msg, kind) {
   commandLog.prepend(line);
   // Keep only the last 12 entries.
   while (commandLog.children.length > 12) commandLog.lastChild.remove();
+}
+
+// ---------- instructor header (Phase 6) -------------------------------------
+function renderInstructorChip({ tenantDisplayName, instructorName: name, tenantId }) {
+  instructorTenant.textContent = tenantDisplayName ?? tenantId ?? '—';
+  instructorName.textContent   = name ?? 'Anonymous';
+  instructorChip.hidden = false;
+  logoutBtn.hidden = false;
+}
+
+function wireLogout() {
+  logoutBtn.addEventListener('click', async () => {
+    logoutBtn.disabled = true;
+    try {
+      await fetch('/api/instructor/logout', {
+        method: 'POST',
+        credentials: 'same-origin',
+      });
+    } catch (err) {
+      // Logout is best-effort — even if the request fails the cookie
+      // will eventually expire. Redirect anyway.
+      console.warn('[grid] logout request failed', err);
+    } finally {
+      window.location.replace('/login.html');
+    }
+  });
 }
 
 // ---------- cleanup ---------------------------------------------------------

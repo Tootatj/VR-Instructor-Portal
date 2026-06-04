@@ -1,0 +1,69 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>OneBonsai Instructor — Sign in</title>
+  <link rel="stylesheet" href="./css/tokens.css">
+  <link rel="stylesheet" href="./css/style.css">
+</head>
+<body class="login-page">
+  <main class="login-shell">
+    <section class="login-card" aria-labelledby="login-title">
+      <header class="login-card__brand">
+        <h1 class="login-card__title" id="login-title">OneBonsai</h1>
+        <p class="login-card__subtitle">Instructor portal</p>
+      </header>
+
+      <form id="login-form" class="login-form" novalidate>
+        <label class="field">
+          <span class="field__label">Company code</span>
+          <input
+            id="code-input"
+            name="code"
+            type="text"
+            inputmode="numeric"
+            autocomplete="off"
+            spellcheck="false"
+            placeholder="e.g. 5555555555"
+            required
+            autofocus
+          >
+        </label>
+
+        <label class="field">
+          <span class="field__label">Your name <span class="field__hint">(optional, shown to your team)</span></span>
+          <input
+            id="name-input"
+            name="displayName"
+            type="text"
+            autocomplete="name"
+            spellcheck="false"
+            placeholder="e.g. Jan"
+            maxlength="48"
+          >
+        </label>
+
+        <div id="login-error" class="login-error" role="alert" hidden></div>
+
+        <button id="login-btn" type="submit" class="btn btn--primary login-form__submit">
+          Sign in
+        </button>
+      </form>
+
+      <footer class="login-card__footer">
+        <p>
+          The code is issued by OneBonsai when your company is set up. The same
+          code is typed in the VR headset on first launch to bind a device to
+          your organization.
+        </p>
+        <p class="login-card__footer-muted">
+          Lost your code? Contact your OneBonsai account manager.
+        </p>
+      </footer>
+    </section>
+  </main>
+
+  <script type="module" src="./js/login.js"></script>
+</body>
+</html>

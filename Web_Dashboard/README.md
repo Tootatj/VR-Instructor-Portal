@@ -13,12 +13,19 @@ Web_Dashboard/
 ├── server.js                 # Express + Socket.IO entry — kept thin
 ├── src/
 │   ├── agora.js              # token minter + canonical channel naming
+│   ├── auth.js               # signed-cookie instructor sessions (Phase 6)
+│   ├── tenants.js            # tenant-code lookup; stub for OneBonsai portal (Phase 6)
 │   ├── pairing.js            # 4-digit code registry + session lifecycle
 │   └── commands.js           # §5.2 command schema validation + relay
+├── data/
+│   └── tenant-codes.json     # static tenant registry; replace with portal HTTP call later
+├── scripts/
+│   └── smoke-phase6.ps1      # end-to-end smoke test for Phase 6 endpoints
 ├── docs/
 │   └── commands.md           # canonical instructor → headset command schema
 └── public/                   # static assets — works without the server too
-    ├── index.html            # OneBonsai grid view (Phase 4.5)
+    ├── index.html            # OneBonsai grid view (Phase 4.5, auth-gated since Phase 6)
+    ├── login.html            # instructor login screen (Phase 6)
     ├── single.html           # legacy single-session debug view (Step 1.5)
     ├── faker.html            # synthetic VR sessions for testing
     ├── css/
@@ -26,6 +33,7 @@ Web_Dashboard/
     │   └── style.css
     └── js/
         ├── grid.js           # multi-session grid client (index.html)
+        ├── login.js          # login form handler (login.html)
         ├── single.js         # single-session client (single.html)
         └── faker.js          # canvas-published faker (faker.html)
 ```
@@ -50,7 +58,13 @@ Web_Dashboard/
    - `AGORA_APP_CERTIFICATE` — same page, "primary certificate". Hard secret.
    - `AGORA_TOKEN_TTL_SECONDS` — leave at the default (1800 = 30 min).
    - `PORT` — HTTP port (default 3000).
-   - `DEFAULT_TENANT_ID` — set to `onebonsai` for the dogfooding demo.
+   - `DEFAULT_TENANT_ID` — used by the unauthenticated faker tool (the
+     dashboard itself gets its tenant from the instructor's session cookie).
+     Leave at `onebonsai` for the dogfooding demo.
+   - `INSTRUCTOR_SESSION_SECRET` — 32+ char random for HMAC-signing the
+     `vrip_instructor` cookie. If unset, the server generates a per-process
+     ephemeral secret (sessions die on restart — fine for dev, never prod).
+     Generate with `node -e "console.log(require('crypto').randomBytes(32).toString('hex'))"`.
 
 ## Run
 
@@ -67,8 +81,10 @@ registers. Click **Spawn demo sessions** in the header (or open
 ## Test the OneBonsai grid end-to-end (~2 minutes)
 
 1. **Start the server**: `npm run dev`.
-2. **Open the grid**: `http://localhost:3000`. Header should show
-   `Live · tenant onebonsai`.
+2. **Open the grid**: `http://localhost:3000` → redirected to
+   `/login.html`. Type `0000000000` (OneBonsai demo tenant) + your
+   name → land on the dashboard. Header shows
+   `OneBonsai (Demo) · <YourName>` + Sign Out.
 3. **Spawn fakers**: click the "Spawn demo sessions" button in the
    header → 5 popup windows open, each registers a synthetic session
    and starts publishing a canvas video. Within ~2 seconds the grid
@@ -81,26 +97,41 @@ registers. Click **Spawn demo sessions** in the header (or open
 6. **Back to grid**: click `‹ Back to grid` → the focused tile tears
    down and the grid re-subscribes to the current page.
 
+**Multi-tenant smoke test:** Sign out, sign back in with code
+`5555555555` (Securitas). The grid is empty — the fakers from step 3
+are in the `onebonsai` tenant and correctly hidden. Try URL-tampering
+by hitting `http://localhost:3000/api/sessions?tenantId=onebonsai`
+directly: the response still reports `"tenantId":"securitas"` (cookie
+wins, URL param ignored). That's the tenant isolation.
+
+For full Phase 6 endpoint coverage, run `scripts/smoke-phase6.ps1`
+against a running server.
+
 To get a real Quest into the grid, see
 [`Devlog.md` §2026-06-03 multi-session BP wiring](../Devlog.md) for the
 per-device channel rename recipe.
 
 ## API + Socket.IO surface
 
-| Surface | Direction | Purpose |
-|---|---|---|
-| `GET /api/health` | any → server | Liveness probe. Returns `{ ok, uptime }`. |
-| `GET /api/config` | client → server | Safe-to-expose client config: `{ appId, defaultTenantId }`. |
-| `GET /api/sessions?tenantId=X&page=N&pageSize=M` | client → server | Paginated list of active sessions for a tenant. |
-| `POST /api/token` | client → server | Mints a short-lived RTC token. Body: `{ code, role, uid? }`. Requires the pairing code to already be registered by a headset (no rando minting). |
-| Socket.IO `headset:register` | headset → server | Headset (or faker) claims a 4-digit code. Payload: `{ code, tenantId, scenario?, traineeName?, source? }`. |
-| Socket.IO `headset:end` | headset → server | Graceful shutdown from the owning headset (Phase 4 `USignalingSubsystem::Deinitialize`). Payload: `{ code }`. Server prunes the room immediately instead of waiting on the ~30 s disconnect timeout. Authz: only the socket that holds the room's `headsetSocketId` may end it. |
-| Socket.IO `instructor:subscribe-tenant` | instructor → server | Grid-view subscription: receive all sessions for a tenant + live `sessions:changed` updates. Payload: `{ tenantId }`, acks with the initial session list. |
-| Socket.IO `instructor:join` | instructor → server | Legacy 1:1 pairing for single-session debug view. Payload: `{ code }`. |
-| Socket.IO `instructor:command` | instructor → server | Dispatch a §5.2 command. Payload includes `code` to target a specific session in the grid view. Validated server-side. |
-| Socket.IO `headset:command` | server → headset | Validated command relayed to the headset socket. |
-| Socket.IO `session:status` | server → both peers in a code | Broadcast `{ state: 'waiting' \| 'connected' \| 'reconnecting' }`. |
-| Socket.IO `sessions:changed` | server → instructor sockets | Tenant-scoped broadcast: full updated session list. Fires on headset register/disconnect. |
+| Surface | Direction | Auth | Purpose |
+|---|---|---|---|
+| `GET /api/health` | any → server | none | Liveness probe. Returns `{ ok, uptime }`. |
+| `GET /api/config` | client → server | none | Safe-to-expose client config: `{ appId, defaultTenantId }`. Used by the faker. |
+| `POST /api/tenant/resolve` | VR → server | none (code IS the credential) | First-launch VR registration. Body: `{ code }` → `{ tenantId, displayName }` or 401. **Phase 6**. |
+| `POST /api/instructor/login` | browser → server | none | Body: `{ code, displayName? }`. Sets `vrip_instructor` cookie. **Phase 6**. |
+| `POST /api/instructor/logout` | browser → server | none | Clears cookie. **Phase 6**. |
+| `GET /api/instructor/me` | browser → server | cookie | Returns logged-in instructor `{ tenantId, tenantDisplayName, instructorName, issuedAt }`. **Phase 6**. |
+| `GET /api/sessions?page=N&pageSize=M` | browser → server | **cookie** | Paginated active sessions; tenant taken from cookie (URL query removed in Phase 6 for security). |
+| `POST /api/token` | client → server | none | Mints a short-lived RTC token. Body: `{ code, role, uid? }`. Requires the pairing code to already be registered by a headset (no rando minting). |
+| `GET /` | browser → server | cookie | 302 → `/login.html` if no session. **Phase 6**. |
+| Socket.IO `headset:register` | headset → server | none (tenantId must be a known tenant) | Headset (or faker) claims a 4-digit code. Payload: `{ code, tenantId, scenario?, traineeName?, source? }`. Phase 6: rejects unknown tenantIds. |
+| Socket.IO `headset:end` | headset → server | room ownership | Graceful shutdown from the owning headset. Payload: `{ code }`. Server prunes the room immediately instead of waiting on the ~30 s disconnect timeout. |
+| Socket.IO `instructor:subscribe-tenant` | instructor → server | **cookie** | Grid-view subscription. Payload is ignored as of Phase 6 — tenantId taken from cookie. Acks with `{ ok, tenantId, sessions }`. |
+| Socket.IO `instructor:join` | instructor → server | none | Legacy 1:1 pairing for single-session debug view. Payload: `{ code }`. |
+| Socket.IO `instructor:command` | instructor → server | role=instructor + same-tenant | Dispatch a §5.2 command. Payload includes `code` to target a specific session. Validated server-side. |
+| Socket.IO `headset:command` | server → headset | — | Validated command relayed to the headset socket. |
+| Socket.IO `session:status` | server → both peers in a code | — | Broadcast `{ state: 'waiting' \| 'connected' \| 'reconnecting' \| 'ended' }`. |
+| Socket.IO `sessions:changed` | server → instructor sockets | — | Tenant-scoped broadcast: full updated session list. Fires on headset register/disconnect/end. |
 
 See `docs/commands.md` for the canonical command schema enforced by
 `src/commands.js`.
