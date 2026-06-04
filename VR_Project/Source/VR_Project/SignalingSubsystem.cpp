@@ -1,5 +1,7 @@
 #include "SignalingSubsystem.h"
 
+#include "TenantRegistry.h"
+
 #include "SocketIOClientComponent.h"
 #include "SIOJsonValue.h"
 #include "SIOJsonObject.h"
@@ -47,12 +49,57 @@ void USignalingSubsystem::Initialize(FSubsystemCollectionBase& Collection)
 {
     Super::Initialize(Collection);
 
+    // GameInstanceSubsystem init order is non-deterministic. Force the
+    // registry to finish its Initialize (which loads the persisted JSON
+    // from disk) BEFORE we ask it for the tenantId below. Without this
+    // we'd race: signaling might read an empty registry, fall through
+    // to the INI fallback, and end up registering on the wrong tenant.
+    Collection.InitializeDependency(UTenantRegistry::StaticClass());
+
     LoadConfig();
     GeneratePairingCode();
+    RefreshTenantFromRegistry();
+
+    // Subscribe to registration changes so:
+    //   - Unregistered boots can pick up a freshly-redeemed code and
+    //     open the socket on the spot, without an app restart.
+    //   - "Switch organisation" (ClearRegistration + new RedeemCode)
+    //     can re-register on a different tenant cleanly.
+    if (UTenantRegistry* Registry = GetGameInstance()->GetSubsystem<UTenantRegistry>())
+    {
+        Registry->OnRegistrationChanged.AddDynamic(this, &USignalingSubsystem::HandleRegistrationChanged);
+    }
 
     UE_LOG(LogVRIPSignaling, Log,
         TEXT("Initialize: code=%s tenant=%s server=%s scenario=\"%s\" trainee=\"%s\""),
         *PairingCode, *TenantId, *ServerUrl, *Scenario, *TraineeName);
+
+    // Defer the socket boot if the device hasn't registered yet AND
+    // the registry is in strict mode. The UMG gate (or any custom
+    // host-app code-input panel) eventually calls
+    // UTenantRegistry::RedeemCode → OnRegistrationChanged → we boot.
+    if (UTenantRegistry* Registry = GetGameInstance()->GetSubsystem<UTenantRegistry>())
+    {
+        if (!Registry->IsRegistered())
+        {
+            // bAllowUnregisteredBoot=true (the dev default) means we
+            // boot anyway with the INI tenant — keeps the existing
+            // onebonsai-only flow working until the UMG gate is wired.
+            bool bAllow = true;
+            GConfig->GetBool(TEXT("/Script/VR_Project.TenantRegistry"),
+                TEXT("bAllowUnregisteredBoot"), bAllow, GGameIni);
+            if (!bAllow)
+            {
+                UE_LOG(LogVRIPSignaling, Log,
+                    TEXT("Initialize: not registered + strict mode — deferring socket boot until OnRegistrationChanged"));
+                SetState(ESignalingState::Disconnected);
+                return;
+            }
+            UE_LOG(LogVRIPSignaling, Warning,
+                TEXT("Initialize: not registered but bAllowUnregisteredBoot=true — booting with INI fallback tenant=%s"),
+                *TenantId);
+        }
+    }
 
     OpenSocket();
 }
@@ -87,6 +134,11 @@ void USignalingSubsystem::LoadConfig()
     // Config/DefaultGame.ini. Falls back to sane defaults so a missing config
     // section never bricks the subsystem (it'll connect to localhost and
     // log enough that the dev knows to fix it).
+    //
+    // NOTE: TenantId is NOT read here anymore. It now comes from
+    // UTenantRegistry::ResolveTenantIdForSignaling() — see
+    // RefreshTenantFromRegistry() below. The INI TenantId is kept as a
+    // dev fallback inside the registry's resolver.
     const TCHAR* Section = TEXT("/Script/VR_Project.SignalingSubsystem");
 
     if (!GConfig->GetString(Section, TEXT("ServerUrl"), ServerUrl, GGameIni) || ServerUrl.IsEmpty())
@@ -94,11 +146,6 @@ void USignalingSubsystem::LoadConfig()
         ServerUrl = TEXT("http://127.0.0.1:3000");
     }
     ServerUrl = NormalizeUrl(ServerUrl);
-
-    if (!GConfig->GetString(Section, TEXT("TenantId"), TenantId, GGameIni) || TenantId.IsEmpty())
-    {
-        TenantId = TEXT("onebonsai");
-    }
 
     if (!GConfig->GetString(Section, TEXT("Scenario"), Scenario, GGameIni))
     {
@@ -108,6 +155,64 @@ void USignalingSubsystem::LoadConfig()
     if (!GConfig->GetString(Section, TEXT("TraineeName"), TraineeName, GGameIni))
     {
         TraineeName = TEXT("Demo Trainee");
+    }
+}
+
+void USignalingSubsystem::RefreshTenantFromRegistry()
+{
+    if (UTenantRegistry* Registry = GetGameInstance()->GetSubsystem<UTenantRegistry>())
+    {
+        TenantId = Registry->ResolveTenantIdForSignaling();
+    }
+    else
+    {
+        // Defensive fallback if for some reason the registry subsystem
+        // didn't init (e.g. an unrelated load-order issue) — log loudly
+        // so it's debuggable, then use the INI default.
+        UE_LOG(LogVRIPSignaling, Error,
+            TEXT("RefreshTenantFromRegistry: UTenantRegistry subsystem not found! Falling back to INI tenant"));
+        GConfig->GetString(TEXT("/Script/VR_Project.SignalingSubsystem"),
+            TEXT("TenantId"), TenantId, GGameIni);
+        if (TenantId.IsEmpty())
+        {
+            TenantId = TEXT("onebonsai");
+        }
+    }
+}
+
+void USignalingSubsystem::HandleRegistrationChanged()
+{
+    UE_LOG(LogVRIPSignaling, Log, TEXT("HandleRegistrationChanged: registry changed, re-resolving tenant"));
+
+    const FString OldTenant = TenantId;
+    RefreshTenantFromRegistry();
+
+    // First-time registration: socket isn't open yet (we were waiting
+    // for this exact event). Open it now with the freshly resolved
+    // tenant.
+    if (!Socket)
+    {
+        UE_LOG(LogVRIPSignaling, Log,
+            TEXT("HandleRegistrationChanged: socket not yet open, opening now with tenant=%s"),
+            *TenantId);
+        OpenSocket();
+        return;
+    }
+
+    // Tenant actually changed at runtime (e.g. "Switch organisation"
+    // pause-menu flow): tear down and reopen with the new tenant.
+    // EmitHeadsetEnd cleans up the previous tenant's session; the
+    // socket disconnect + reconnect will re-register cleanly under
+    // the new tenant.
+    if (OldTenant != TenantId)
+    {
+        UE_LOG(LogVRIPSignaling, Log,
+            TEXT("HandleRegistrationChanged: tenant changed %s -> %s, reconnecting"),
+            *OldTenant, *TenantId);
+        EmitHeadsetEnd();
+        Socket->SyncDisconnect();
+        Socket = nullptr;
+        OpenSocket();
     }
 }
 

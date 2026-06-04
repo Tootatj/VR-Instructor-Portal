@@ -137,6 +137,15 @@ private:
 
     void SetState(ESignalingState NewState);
 
+    // Phase 6D: tenantId comes from UTenantRegistry (the persisted
+    // first-launch redemption), with the INI value as a dev fallback.
+    // If the user hasn't registered and bAllowUnregisteredBoot is false
+    // on the registry side, we listen for OnRegistrationChanged and
+    // defer the socket boot until registration lands.
+    UFUNCTION()
+    void HandleRegistrationChanged();
+    void RefreshTenantFromRegistry();
+
     // Bound to USocketIOClientComponent's BlueprintAssignable delegates.
     UFUNCTION()
     void HandleSocketConnected(FString SocketId, FString SessionId, bool bIsReconnection);

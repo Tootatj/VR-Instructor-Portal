@@ -1,11 +1,12 @@
 # How to Port the VR Instructor Portal into Another Unreal Project
 
-> **Last verified against:** UE 5.5.4 · PICOXR 3.4.1 · SocketIOClient v2.9.0 · Agora-Unreal-RTC-SDK v4.5.1 · `USignalingSubsystem` git rev `d65bc98`
+> **Last verified against:** UE 5.5.4 · PICOXR 3.4.1 · SocketIOClient v2.9.0 · Agora-Unreal-RTC-SDK v4.5.1 · `USignalingSubsystem` + `UTenantRegistry` git rev `8e1c8b6`
 >
-> **Maintainer rule:** every time `SignalingSubsystem.h/.cpp`, the BP integration
-> shape on `BP_VRPawn`, or the plugin set changes, update the matching section
-> below in the same commit. Add a row to the bottom of the *Change log* at the
-> end of this file with the date + commit hash + one-line "what changed".
+> **Maintainer rule:** every time `SignalingSubsystem.h/.cpp`, `TenantRegistry.h/.cpp`,
+> the BP integration shape on `BP_VRPawn`, or the plugin set changes, update
+> the matching section below in the same commit. Add a row to the bottom of
+> the *Change log* at the end of this file with the date + commit hash +
+> one-line "what changed".
 
 This guide tells you how to take the signaling + pairing + command-relay
 layer from this project and reuse it in a **different Unreal Engine 5.5+
@@ -23,8 +24,9 @@ porting work below is entirely about the Unreal side.
 | Component | Portability |
 |---|---|
 | `SignalingSubsystem.h/.cpp` | **Drop-in.** Zero dependency on this project's pawn, scene, or Agora. Pure UE + Socket.IO + HTTP. |
+| `TenantRegistry.h/.cpp` | **Drop-in.** Pure UE + HTTP + `FFileHelper`. Owns the first-launch company-code redemption + persistence. **Replaces any prior hardcoded `TenantId` in INI.** Has no UMG dependency — host apps can use their existing in-VR code-input panel (see *BYO code-input UI* section below). |
 | `Web_Dashboard/` server | **Already portable.** Runs once, serves any UE app that speaks the wire protocol. |
-| BP integration on `BP_VRPawn` | **Pattern, not asset.** Reproduce the 3 graphs in the target project's pawn or game mode. Worked example included. |
+| BP integration on `BP_VRPawn` | **Pattern, not asset.** Reproduce the 3 (now 4 — registration gate) graphs in the target project's pawn or game mode. Worked example included. |
 | Agora streaming pipeline (`AgoraVideoPump.h/.cpp` + Agora plugin) | **Optional / copyable.** Only needed if the target project has no streaming and you want this stack to provide it. |
 | PICOXR + universal-VR config | **Drop-in via** [`VR_Project/Plugins/README.md`](VR_Project/Plugins/README.md). Same recipe regardless of target. |
 
@@ -66,29 +68,44 @@ Append to `<TargetProject>/Source/<TargetModule>/<TargetModule>.Build.cs`:
 PrivateDependencyModuleNames.AddRange(new string[] { "SocketIOClient", "SIOJson", "HTTP", "Json" });
 ```
 
-### A.2. Copy the two C++ files
+### A.2. Copy the C++ files
 
 ```powershell
-copy VR_Project\Source\VR_Project\SignalingSubsystem.h <Target>\Source\<TargetModule>\
+copy VR_Project\Source\VR_Project\SignalingSubsystem.h  <Target>\Source\<TargetModule>\
 copy VR_Project\Source\VR_Project\SignalingSubsystem.cpp <Target>\Source\<TargetModule>\
+copy VR_Project\Source\VR_Project\TenantRegistry.h      <Target>\Source\<TargetModule>\
+copy VR_Project\Source\VR_Project\TenantRegistry.cpp    <Target>\Source\<TargetModule>\
 ```
 
-The class needs **no edits** unless the target's module API macro differs:
-in `SignalingSubsystem.h`, change `VR_PROJECT_API` to `<TARGETMODULE>_API`
-(the macro UBT generates per module, all-caps + `_API`).
+The classes need **no edits** unless the target's module API macro differs:
+in `SignalingSubsystem.h` and `TenantRegistry.h`, change `VR_PROJECT_API`
+to `<TARGETMODULE>_API` (the macro UBT generates per module, all-caps +
+`_API`). The `#include "TenantRegistry.h"` in `SignalingSubsystem.cpp`
+should not need editing — both files end up in the same module.
 
 ### A.3. Add the INI config block
 
 In `<Target>/Config/DefaultGame.ini`, add:
 
 ```ini
-; The section *name* must match the target module's reflected path:
+; The section *names* must match the target module's reflected path:
 ; [/Script/<TargetModuleName>.SignalingSubsystem]
+; [/Script/<TargetModuleName>.TenantRegistry]
 [/Script/<TargetModule>.SignalingSubsystem]
 ServerUrl="http://<dashboard-host>:3000"
-TenantId=<your-tenant-slug>
+TenantId=<dev-fallback-tenant-slug>   ; ONLY used when bAllowUnregisteredBoot=true below
 Scenario=<default scenario name displayed on dashboard grid tile>
 TraineeName=<default trainee name>
+
+[/Script/<TargetModule>.TenantRegistry]
+; ServerUrl falls back to the SignalingSubsystem URL above if omitted.
+; bAllowUnregisteredBoot:
+;   true  (dev/CI) — boot signaling with the INI TenantId above if no
+;         registration file exists yet. Useful before the registration
+;         UI is wired.
+;   false (prod)   — block signaling until UTenantRegistry::RedeemCode
+;         succeeds. This is the production setting.
+bAllowUnregisteredBoot=False
 ```
 
 **The `ServerUrl` value MUST be quoted.** UE's INI parser truncates
@@ -252,19 +269,80 @@ since the target is not deploying to Meta hardware. Everything else
 | `<Target>.uproject` | Add `SocketIOClient` + `PICOXR` (if VR) plugin entries. |
 | `Source/<Module>/<Module>.Build.cs` | Add `SocketIOClient`, `SIOJson`, `HTTP`, `Json` to `PrivateDependencyModuleNames`. |
 | `Source/<Module>/SignalingSubsystem.h/.cpp` | New files (copied from this project). Update `VR_PROJECT_API` → `<MODULE>_API` if needed. |
+| `Source/<Module>/TenantRegistry.h/.cpp` | New files (copied from this project). Update `VR_PROJECT_API` → `<MODULE>_API` if needed. |
 | `Source/<Module>/AgoraVideoPump.h/.cpp` | New files, **only if Recipe B**. |
-| `Config/DefaultGame.ini` | New `[/Script/<Module>.SignalingSubsystem]` block. |
+| `Config/DefaultGame.ini` | New `[/Script/<Module>.SignalingSubsystem]` and `[/Script/<Module>.TenantRegistry]` blocks. |
 | `Config/DefaultEngine.ini` | Update `[/Script/AndroidRuntimeSettings.AndroidRuntimeSettings]` + add `[/Script/PICOXRHMD.PICOXRSettings]` (if VR). |
-| `<Pawn or game mode>.uasset` | The three BP graph edits — `OnSignalingReady` event, `BeginPlay` gate, three literal-to-variable-read pin replacements. |
+| `<Pawn or game mode>.uasset` | The BP graph edits — `OnSignalingReady` event, `BeginPlay` gate, three literal-to-variable-read pin replacements, plus showing the registration panel if `!IsRegistered()`. |
+| Existing code-input panel BP (or new `WBP_RegistrationGate`) | Wire Submit → `RedeemCode` + callback; bind `OnRegistrationChanged` to re-show on clear. See *BYO code-input UI* section. |
 | `.gitignore` | Add the three plugin folders (they're not source-controlled). |
 | `Plugins/README.md` (or equivalent) | Document the install recipes + the PICOXR patch. |
 
 ---
 
+## BYO code-input UI — porting into an app that already has a registration panel
+
+If the target VR app already has its own in-VR code-input panel (e.g.
+one of the apps already plugged into OneBonsai's existing company-
+management system), you do **not** need to ship `WBP_RegistrationGate`.
+The `UTenantRegistry` subsystem is the only integration seam — by
+design.
+
+The minimum wiring on the host app side:
+
+1. **Drop in the C++ files** (Recipes A.2 + A.3 above).
+2. **In your existing panel's submit handler BP graph:**
+
+   ```
+   [On Submit Clicked]
+       → Get Game Instance → Get Subsystem (UTenantRegistry)
+       → Redeem Code:
+            Code = <your text-input widget's text>
+            Callback = bind a Custom Event with signature (bool bSuccess, FString ErrorMessage)
+                On bSuccess=true  → hide your panel + unblock the app start flow
+                On bSuccess=false → display ErrorMessage in your existing error label
+   ```
+
+3. **Bind `OnRegistrationChanged` once at panel-construct time** to handle the case where the registration is wiped at runtime (e.g. via your existing "switch organization" / "log out" affordance):
+
+   ```
+   [Construct]
+       → Get Game Instance → Get Subsystem (UTenantRegistry)
+       → Assign OnRegistrationChanged:
+            On fire → if IsRegistered() == false: show your panel again
+   ```
+
+4. **No other panel changes needed.** The host app's existing scene start
+   logic should already be gated on "have we got a tenant?" somewhere
+   if the existing system worked at all — just route that gate through
+   `UTenantRegistry::IsRegistered()` instead of whatever local flag it
+   used before.
+
+The BP-callable surface area on `UTenantRegistry` is intentionally
+minimal:
+
+| BP function | Purpose |
+|---|---|
+| `Is Registered` (pure) | UI shows / hides the input panel based on this. |
+| `Get Tenant Id` (pure) | For display ("you're registered with: securitas"). |
+| `Get Display Name` (pure) | For display ("Securitas Training"). |
+| `Get Registration Code` (pure) | For display in a "Switch organization" confirmation screen. |
+| `Redeem Code` (callable) | Called by your panel's Submit handler. |
+| `Clear Registration` (callable) | Wire to a "Switch organization" / "Log out" button. Triggers re-show of your panel via `OnRegistrationChanged`. |
+
+Once you've wired your existing panel to `RedeemCode`, set
+`bAllowUnregisteredBoot=False` in `DefaultGame.ini` (Recipe A.3) so the
+signaling subsystem refuses to boot until your panel completes — this
+guarantees a fresh-install device can never accidentally connect under
+the dev-fallback tenant.
+
+---
+
 ## Common gotchas (we paid the tax, you don't have to)
 
-These all hit us during initial Phase 4 build-out — every one is captured
-in the Devlog but worth surfacing here so a porter doesn't have to dig:
+These all hit us during initial Phase 4 / Phase 6D build-out — every one
+is captured in the Devlog but worth surfacing here so a porter doesn't
+have to dig:
 
 1. **`ServerUrl` must be quoted in the INI.** Otherwise `:` truncates the value.
 2. **PICOXR's `AndroidThunkJava_IsOculusMobileApplication()` Java injection conflicts with UE's.** Patch out PICOXR's copy. See [`VR_Project/Plugins/README.md` § PICOXR](VR_Project/Plugins/README.md#required-patch--duplicate-java-method) for the exact patch and rationale.
@@ -273,6 +351,7 @@ in the Devlog but worth surfacing here so a porter doesn't have to dig:
 5. **RT format `RTF_RGBA8_SRGB` is non-negotiable for the video pump.** `RTF_RGBA8` produces correct-looking output in-engine but 2.4× too dark in the browser. Full diagnosis in Devlog 2026-06-03 "Phase 3 polish, section B".
 6. **`MinSDKVersion=29`** for any APK targeting both Quest and Pico 4 Enterprise. Pico 4E runs PICO OS on Android 10 = API 29. Meta's API 32 floor is a *store* check only, not an install-time check; sideloaded universal APKs install fine on Quest with MinSDK=29.
 7. **First cold cook with these plugins takes ~2 extra minutes** (compiling Socket.IO's bundled C++ libs: asio, rapidjson, websocketpp). Subsequent cooks reuse the built artifacts. Don't panic on the first build.
+8. **`UGameInstanceSubsystem` init order is non-deterministic.** `USignalingSubsystem::Initialize` calls `Collection.InitializeDependency(UTenantRegistry::StaticClass())` to guarantee the registry has loaded its persisted JSON before the resolved tenantId is read. Don't remove that call. Without it, a fresh boot races: half the time signaling reads an empty registry, falls through to the INI tenant, and the device ends up wrong-tenant-bound for the session.
 
 ---
 
@@ -316,4 +395,5 @@ Append a row when this guide's prescriptions change (new plugin, BP shape change
 
 | Date | Commit | What changed |
 |---|---|---|
-| 2026-06-04 | `<this commit>` | Initial guide. Covers `USignalingSubsystem` (rev `d65bc98`), PICOXR 3.4.1 + duplicate-method patch, AgoraVideoPump (Recipe B), 7 common gotchas, future-plugin proposal. |
+| 2026-06-04 | `<this commit>` | Phase 6D: added `UTenantRegistry` (first-launch code-redemption subsystem with persisted tenant binding); new INI block `[/Script/<Module>.TenantRegistry]`; new *BYO code-input UI* section for host apps that already have a registration panel; new gotcha #8 about `InitializeDependency` ordering between signaling and registry. |
+| 2026-06-04 | `d65bc98` | Initial guide. Covers `USignalingSubsystem` (rev `d65bc98`), PICOXR 3.4.1 + duplicate-method patch, AgoraVideoPump (Recipe B), 7 common gotchas, future-plugin proposal. |
