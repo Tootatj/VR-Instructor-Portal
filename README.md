@@ -8,13 +8,17 @@ WebRTC, talks bidirectionally, and dispatches JSON commands.
 
 For full architecture, conventions, and performance constraints see
 [`.cursorrules`](.cursorrules). For session-by-session progress, decisions,
-and rollbacks see [`Devlog.md`](Devlog.md).
+and rollbacks see [`Devlog.md`](Devlog.md). To reuse the signaling +
+streaming layer in a different UE project (e.g., a different OneBonsai
+training app that should also be streamable into the instructor
+dashboard), see [`HowToPort.md`](HowToPort.md).
 
 ## Repository layout
 
 ```
 .cursorrules        Master technical contract (architecture, conventions, perf bars)
 Devlog.md           Operational ledger (session notes, decisions, rollbacks, backlog)
+HowToPort.md        Recipe for reusing this project's signaling layer in another UE app
 VR_Project/         Unreal Engine 5.5.4 mobile VR client
 Web_Dashboard/      Node.js + Express + Socket.IO server + vanilla-JS SPA (not yet scaffolded)
 ```
