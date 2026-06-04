@@ -614,12 +614,66 @@ This closes the "Pico cross-platform parity" backlog item from the 2026-06-03 *P
 
 **Net state after this entry.** The OneBonsai grid view runs on heterogeneous fleets: any combination of Quest 2/3/Pro/3S + Pico Neo3/4/4E from a single APK. Per-device config is now strictly an `adb install` + the device's own VR launcher. Phase C (in-VR pairing HUD widget) and Phase D (`OnHeadsetCommand` BP graph for `pause_simulation` and friends) are the natural next stops.
 
+### 2026-06-04 — Phase 6 scope revision: hook into existing OneBonsai app-management portal
+
+Discovery during a "how would this eventually look in production" planning conversation: **OneBonsai already operates an internal app-management portal** that handles organization registration for other in-house apps. Apps in that ecosystem open fresh from install, prompt the user to enter a *registration code* in VR, hit the portal's backend, and the portal binds the device to a company/domain forever after. This is exactly the Organization Pairing Code (OPC) layer that the 2026-06-03 multi-tenant strategy discussion sketched out — except OneBonsai has already built it for other apps and we just need to plug in.
+
+**Architectural shape now confirmed: two stacked codes, two systems, one wire format.**
+
+| Layer | Source | Built where | Lifetime |
+|---|---|---|---|
+| **Organization Registration Code (OPC)** | Existing OneBonsai portal | Done (used by other in-house apps) | Persisted on device, set once at first install |
+| **Session Pairing Code** | `USignalingSubsystem` | Done (Phase 4A) | Random per cold launch, retained across hot reconnects |
+
+The two layers compose cleanly. The OPC determines *which tenant* the headset belongs to; the session code determines *which instructor view* a given session shows up under within that tenant. Channel naming becomes `t-<tenantId>-<pairingCode>` exactly as we've been using `t-onebonsai-XXXX` — the only change is `<tenantId>` becomes a runtime value read from the persisted OPC redemption response rather than a hardcoded INI string.
+
+**Concrete wiring for the eventual implementation (captured here so the design is ready when we start the work):**
+
+- **Headset side (first launch only):** UMG widget that prompts for the OPC. On submit → `HTTP POST <portal-domain>/api/register/redeem { code }` → 200 returns `{ tenantId, displayName, ... }`. Persist tenantId via `FFileHelper::SaveStringToFile` into `FPaths::ProjectSavedDir()/Config/OneBonsaiRegistration.ini` (or equivalent). On every subsequent launch, read it back and skip the UMG.
+- **Headset side (always):** `USignalingSubsystem::LoadConfig` reads tenantId from the persisted file instead of `DefaultGame.ini`. Falls back to INI value if the persisted file is missing (lets us keep `onebonsai` as the dev/CI default without registration).
+- **Portal side:** add `POST /api/register/redeem` if it doesn't already exist for OneBonsai's app codes (it almost certainly does — that's the whole point of the existing portal). No other portal-side changes if their existing endpoint shape matches.
+- **Signaling server side:** trivial. Already keys everything on tenantId. Maybe add a `GET /api/tenants/:id/info` endpoint that round-trips to the portal to confirm the tenant exists + fetch display metadata for the grid header.
+
+**Instructor overview embedding — four patterns ranked by effort.**
+
+| Pattern | What it is | Effort |
+|---|---|---|
+| **A. iframe embed** | Portal iframes our `https://signaling.onebonsai.com/?tenantId=X` into an "Instructor" tab | ~1 hour |
+| **B. Subpath reverse-proxy** | Portal proxies `/instructor/*` → our Node server (same domain, shared cookies) | ~half day |
+| **C. JS SDK embed** | Extract grid + focus view into `@onebonsai/instructor-portal-sdk`; portal imports + mounts into a `<div>` | ~2 days |
+| **D. Full port** | Rewrite grid + focus + command deck inside the portal's frontend stack, calling our Socket.IO server as pure backend | ~1 week |
+
+**Recommendation:** ship A first (afternoon of work, working "Instructor" tab); upgrade to B when iframe auth context becomes annoying; only invest in C/D if product demand specifically calls for tighter visual integration than B provides. Worth noting that the web dashboard was built in dependency-free vanilla JS specifically so we have the option of doing C/D later without first having to undo a framework choice.
+
+**Server-side production hardening required before any embedding pattern goes live** (independent of which pattern is chosen):
+
+- **Auth.** Currently none. Must accept the portal's auth tokens (JWT with `tenantId` claim or equivalent), enforce on every `/api/*` + every Socket.IO event that touches tenant data. Middleware lives in front of `pairing.js`/`commands.js`/`agora.js`.
+- **CORS.** Currently `*`. Lock to specific OneBonsai domains.
+- **TLS.** Currently HTTP. Production needs HTTPS — required anyway for browser `getUserMedia()` mic access in focus mode.
+- **Persistent storage.** In-memory `ROOMS` registry stays (sessions are ephemeral by design). New: small DB (SQLite is fine; Postgres if we want managed) for per-tenant Agora project IDs + pairing audit logs. The `getAgoraCredentials(tenantId)` seam mandated by `.cursorrules §4.3.1` is already there — it just currently returns the same hard-coded `.env` value for every tenant.
+
+**Effort estimate revised.** Original Phase 6 ballpark was 2 weeks of work (build customer admin page + OPC generation + auth + persistence + embedding). With the OPC layer pre-built by OneBonsai's existing portal, **Phase 6 drops to roughly 1 week**:
+
+- ~1 day: UE first-launch UMG + tenantId persistence + subsystem integration
+- ~half day: portal endpoint integration (if not already shaped right)
+- ~3-5 days: server hardening (auth + CORS + TLS + DB for per-tenant Agora creds)
+- ~1 hour - 2 days: embedding integration depending on pattern A vs C
+
+**Open decisions for when Phase 6 actually starts.**
+
+1. Which embedding pattern is the v1 target? Default assumption: A → B trajectory.
+2. What auth does OneBonsai's portal already issue? JWT vs session cookie determines the middleware shape on our side.
+3. Per-tenant Agora projects, or single shared Agora project with per-tenant channel namespacing? The latter is operationally simpler; the former gives clean billing splits per customer. Likely depends on Agora's pricing tiers + how OneBonsai bills customers.
+4. Does the portal's existing redemption endpoint return tenantId in the shape we want, or do we need a new endpoint specifically for VR-app registration? Cosmetic question — both work.
+
+**Things to keep stable across Phase 6.** Don't break the existing `t-<tenantId>-<pairingCode>` channel naming convention — it's load-bearing across server, BP, and (after the persistence change) the registration redemption response. The `USignalingSubsystem` public API surface (the 4 BP-readable credentials + 4 delegates + the state machine) should also stay stable — that's what makes the layer drop-in portable per `HowToPort.md`. Phase 6 is internal plumbing (where does `TenantId` come from at boot) plus deployment hardening, not an API redesign.
+
 ### Open Backlog Items
 
 - **Phase 4 Phases C–D — final BP integration:** (1) `WBP_PairingHUD` UMG widget showing the pairing code + connection state, added to viewport from BeginPlay; (2) `OnHeadsetCommand` bound graph on `BP_VRPawn` that switches on `Command` and fires per-command BP events (`pause_simulation` toggles `Set Game Paused`; others log to HUD).
 - **Phase 4 Phase E token refresh — BP wiring.** Bind Agora's `OnTokenPrivilegeWillExpire` → call `Get Signaling Subsystem → RefreshToken` → on the subsystem's `OnTokenRefreshed` delegate, call Agora's `renewToken` with the freshly-populated AgoraToken. C++ side is already wired; this is one BP graph edit.
 - **Phase 5:** broader instructor-facing polish (per-tenant branding, real session metadata from the headset rather than the stub).
-- **Phase 6 — Multi-tenant SaaS layer.** Instructor authentication (Clerk/Auth0/Supabase Auth with `tenantId` JWT claim), customer admin page (Org dashboard + Organization Pairing Code generation), `POST /api/orgs/redeem` endpoint, persisted-tenantId storage on the headset side, server-side JWT-claim enforcement on all existing endpoints. Per the 2026-06-03 multi-tenant strategy discussion: universal APK + first-launch pairing was the chosen distribution model for Securitas/CustomerX-style customer onboarding.
+- **Phase 6 — Multi-tenant SaaS layer.** ~~Instructor authentication (Clerk/Auth0/Supabase Auth with `tenantId` JWT claim), customer admin page (Org dashboard + Organization Pairing Code generation), `POST /api/orgs/redeem` endpoint, persisted-tenantId storage on the headset side, server-side JWT-claim enforcement on all existing endpoints.~~ **Scope revised 2026-06-04** — OneBonsai already operates an internal app-management portal that mints + redeems organization registration codes for other in-house apps. Phase 6 becomes "hook into that portal" instead of "build a parallel customer admin page": persisted-tenantId on the headset side + first-launch UMG that calls the portal's `POST /api/register/redeem` + server-side JWT enforcement using the portal's auth tokens. The 4 instructor-overview embedding patterns (iframe / reverse-proxy / JS SDK / native port) are pre-architected in the 2026-06-04 Phase 6 scope-revision entry — current recommendation is "iframe first, reverse-proxy when iframe auth quirks bite."
 - Rename `VRPawn` → `BP_VRPawn` to match `.cursorrules §4.2` naming convention (cosmetic refactor; not urgent).
 - Re-color the four Phase 2 Print Strings (currently all yellow) — green/red/cyan/yellow for join/error/peer-join/leave readability.
 - Tighten Socket.IO CORS before any LAN/internet-facing deploy (currently permissive for development).
