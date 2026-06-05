@@ -72,6 +72,27 @@ DECLARE_DYNAMIC_MULTICAST_DELEGATE(FOnTokenRefreshed);
 DECLARE_DYNAMIC_MULTICAST_DELEGATE_OneParam(FOnSignalingStateChanged, ESignalingState, NewState);
 DECLARE_DYNAMIC_MULTICAST_DELEGATE_OneParam(FOnHeadsetCommand, const FSignalingCommand&, Command);
 
+// Fired when the Agora channel the headset is supposed to be publishing on
+// changes AFTER the first successful credentials fetch — i.e. mid-session
+// tenant swaps via UTenantRegistry (`ClearRegistration` and/or `RedeemCode`).
+//
+// First-boot credentials never fire this; they fire OnCredentialsReady as
+// before, so existing BP graphs that initialise + JoinChannel on first
+// credentials keep working untouched.
+//
+// `NewChannel.IsEmpty()` means "leave the current channel, no rejoin coming"
+// (e.g. user called ClearRegistration without a follow-up RedeemCode — device
+// is in limbo until a new code is redeemed). BP should LeaveChannel and stop
+// the video pump but NOT attempt to JoinChannel on an empty string.
+//
+// Non-empty `NewChannel` means "swap channels": BP should
+//   1. UAgoraVideoPump::StopVideoPump (or RestartForNewChannel after JoinChannel succeeds)
+//   2. Agora LeaveChannel
+//   3. Agora JoinChannel(NewChannel, subsystem.AgoraToken, subsystem.AgoraUid)
+//   4. On OnJoinChannelSuccess: UAgoraVideoPump::StartVideoPump
+// See Devlog "Phase 6D channel-swap fix" entry for the why.
+DECLARE_DYNAMIC_MULTICAST_DELEGATE_OneParam(FOnAgoraChannelChanged, const FString&, NewChannel);
+
 UCLASS()
 class VR_PROJECT_API USignalingSubsystem : public UGameInstanceSubsystem
 {
@@ -117,6 +138,9 @@ public:
 
     UPROPERTY(BlueprintAssignable, Category = "Signaling")
     FOnHeadsetCommand OnHeadsetCommand;
+
+    UPROPERTY(BlueprintAssignable, Category = "Signaling")
+    FOnAgoraChannelChanged OnAgoraChannelChanged;
 
     // --- BP-callable ---
 
@@ -178,4 +202,12 @@ private:
     double LastExpiresAtUnixSeconds = 0.0;
     bool bRefreshInFlight = false;
     bool bRegisterInFlight = false;
+
+    // True after the first non-refresh /api/token response has fired
+    // OnCredentialsReady. Subsequent non-refresh token fetches (caused by a
+    // re-registration or tenant swap) fire OnAgoraChannelChanged instead, so
+    // the first-boot BP graph that does Initialize+JoinChannel only ever runs
+    // once and the second/third/Nth credentials cycle goes through the
+    // channel-swap path (LeaveChannel + JoinChannel + pump restart).
+    bool bHasFiredInitialCredentials = false;
 };

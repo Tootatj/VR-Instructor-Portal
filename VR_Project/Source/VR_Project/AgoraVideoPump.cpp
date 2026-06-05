@@ -143,6 +143,17 @@ void UAgoraVideoPump::StopVideoPump()
     UE_LOG(LogAgoraVideoPump, Display, TEXT("StopVideoPump: stopped."));
 }
 
+void UAgoraVideoPump::RestartForNewChannel()
+{
+    UE_LOG(LogAgoraVideoPump, Display,
+        TEXT("RestartForNewChannel: cycling pump (wasRunning=%d, externalSourceEnabled=%d)"),
+        PumpTimer.IsValid() ? 1 : 0,
+        bExternalSourceEnabled ? 1 : 0);
+
+    StopVideoPump();
+    StartVideoPump();
+}
+
 void UAgoraVideoPump::EndPlay(const EEndPlayReason::Type EndPlayReason)
 {
     StopVideoPump();

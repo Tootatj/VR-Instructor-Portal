@@ -710,16 +710,82 @@ Implemented the server half of the single-code multi-tenant model sketched out i
 
 **Next:** Phase 6D (the VR half) — `UTenantRegistry` GameInstanceSubsystem with `RedeemCode/IsRegistered/GetTenantId/ClearRegistration`, persistence to `Saved/Config/OneBonsaiRegistration.json`, hook into `BeginPlay`, swap `USignalingSubsystem::LoadConfig` to read from registry. ~1 day estimated; will conclude with a 2-device test (Quest registers as Securitas, Pico as CustomerX, two instructor logins see fully separated grids).
 
+### 2026-06-05 — Phase 6D shipped (rescued write-up) + channel-swap fix (cure video pump drop on mid-session tenant swap)
+
+Two pieces in one entry: the Phase 6D delivery write-up that yesterday's session ended before getting to, and a same-day bug-and-fix that came out of validating it end-to-end.
+
+**Phase 6D delivered (yesterday afternoon, undocumented until now).** The Phase 6 A/B/C entry above ended with a "Next: Phase 6D" promissory note. Phase 6D actually shipped about three hours later but the Devlog write-up didn't make it in before EOD. Pieces that landed:
+
+- `Source/VR_Project/TenantRegistry.{h,cpp}` — `UTenantRegistry` `UGameInstanceSubsystem`. Persists `Saved/Config/OneBonsaiRegistration.json` (`{tenantId, displayName, code, registeredAtUnix, schemaVersion}`). Public BP API: `RedeemCode(code, callback) → POST /api/tenant/resolve`, `ClearRegistration`, pure getters (`IsRegistered`, `GetTenantId`, `GetDisplayName`, `GetRegistrationCode`), `OnRegistrationChanged` multicast.
+- `SignalingSubsystem` modifications — `Initialize` now calls `Collection.InitializeDependency(UTenantRegistry::StaticClass())` to fix the race (without it, signaling occasionally read an empty registry and fell through to the INI dev fallback). Reads `tenantId` from `Registry->ResolveTenantIdForSignaling()` instead of the INI. Subscribes to `OnRegistrationChanged` to handle the three runtime paths: unregister-from-registered (Path A — tear down socket + clear creds + park), redeem-while-disconnected (Path B — open socket on the new tenant), and direct switch-org (Path C — leave + rejoin).
+- `[/Script/VR_Project.TenantRegistry]` INI block with `bAllowUnregisteredBoot=False` for production-style strict mode (signaling refuses to boot until the user redeems a code; the INI `TenantId` becomes a dev-only fallback that's only consulted when `bAllowUnregisteredBoot=true`).
+- `Content/UI/WBP_RegistrationGate.uasset` — UMG widget with text input + status row; calls `RedeemCode` and surfaces success/error from the callback. The reference UI; explicitly *optional* per the *BYO code-input UI* design in `HowToPort.md` — host apps already wired into OneBonsai's existing company-management system can drive `RedeemCode` from their own panel and skip this widget entirely.
+- `Content/UI/BP_RegistrationGateActor.uasset` — world-space widget host (3D-VR-friendly placement; `WBP_RegistrationGate` is a UMG widget, this actor wraps it for in-scene placement).
+- `BP_VRPawn` updates — registration-gate spawn on `BeginPlay` if `!IsRegistered()`, hide on `OnRegistrationChanged → IsRegistered()==true`.
+
+Validated end-to-end on the desk yesterday: fresh install → enter `0000000000` → registered as `onebonsai`; restart app → auto-resumes into the same tenant without re-prompting (persistence works). All Phase 6D acceptance criteria green.
+
+---
+
+**The bug that fell out of validation: mid-session tenant swap silently broke the video pump.** Same session, two-step repro: register as `onebonsai`, video shows on the OneBonsai grid. Without restarting, hit "switch organisation" (`ClearRegistration`) and re-redeem with `5555555555` (Securitas). The headset correctly registers under the new tenant — server logs `headset:register tenant=securitas`, `/api/sessions` shows the new session in the Securitas tenant — but the new instructor sees a **black tile**. The pump's own log was clean (`StartVideoPump: pumping 1280x720 @ 30.0 Hz`, no errors, `pushVideoFrame` returning 0), which is what made it sneaky.
+
+**Root cause: no contract between the registry-swap path and the Agora channel lifecycle.** Walked the state machine:
+
+1. `ClearRegistration` → `HandleRegistrationChanged` Path A → tears down the *socket* + clears credentials + sets state `Disconnected`. Does **not** tell anything about the *Agora channel*. Pump keeps pushing 30 fps into the engine's external video source.
+2. `RedeemCode("5555555555")` → success → `HandleRegistrationChanged` Path B → opens a new socket → re-registers → re-fetches token → fires `OnCredentialsReady` for the *second* time with `AgoraChannel = "t-securitas-XXXX"`.
+3. The BP `OnCredentialsReady` graph was authored for first-boot — it does `RtcEngine.Initialize` + `JoinChannel`. On the second fire it tries to Initialize-or-Join into an engine still sitting in the old channel. Agora 4.x doesn't clean that up implicitly; the *old* channel's local video track stays live, the *new* channel has no published local video.
+4. Instructor on the Securitas tenant joins `t-securitas-XXXX`, sees no published video → black tile. Pump is still happily pushing frames into the old channel's track that nobody is subscribed to.
+
+**Fix shape: explicit "channel changed" signal + pump-restart wrapper.**
+
+- New `USignalingSubsystem` BP-assignable delegate `OnAgoraChannelChanged(NewChannel)`. Empty `NewChannel` = "leave-only, no rejoin coming" (Path A — `ClearRegistration` without follow-up `RedeemCode`). Non-empty = "swap to this channel" (Path B/C after `/api/token` returns the new credentials).
+- New `bHasFiredInitialCredentials` gating flag. First successful non-refresh `/api/token` still fires `OnCredentialsReady` (BP first-boot init path is untouched); every subsequent non-refresh credentials fetch routes through `OnAgoraChannelChanged` instead, so the BP first-boot `Initialize`+`JoinChannel` graph only ever runs once. Token refreshes (`bWasRefresh=true`) keep firing `OnTokenRefreshed` unchanged — they're within-channel rotations and don't trigger a channel transition.
+- New `UAgoraVideoPump::RestartForNewChannel()` BP-callable — wraps `StopVideoPump(); StartVideoPump();`. The reason a wrapper is needed (and not just "call `StartVideoPump` again"): the `setExternalVideoSource(false)` → `setExternalVideoSource(true)` toggle inside the stop/start pair is what actually rebinds the external frame source to the *new* channel's newly-created local video track. `setExternalVideoSource` is engine-scope, not channel-scope, but the binding to the local video track resets on `LeaveChannel`. Calling only `StartVideoPump` when already running is a no-op and would not fix the binding.
+
+**BP wiring on `BP_VRPawn` (the user-facing part).** Single new event graph:
+
+```
+On Agora Channel Changed (NewChannel)
+  ├─ Branch [NewChannel == ""]
+  │    True  → VideoPump.StopVideoPump → Agora.LeaveChannel
+  │    False → VideoPump.StopVideoPump
+  │             └─ Agora.LeaveChannel
+  │                └─ Agora.JoinChannel(NewChannel, Signaling.AgoraToken, Signaling.AgoraUid)
+
+Agora OnJoinChannelSuccess (existing)
+  └─ VideoPump.RestartForNewChannel    (idempotent; no-op on first boot too — Stop early-exits if nothing's running)
+```
+
+Wired in the editor; `VRPawn.uasset` updated in this commit.
+
+**Validation.** PIE single-device, three independent scenarios green:
+
+1. **First-boot registered.** Cold launch → `Initialize: server=... persisted=yes tenant=onebonsai` → socket opens → credentials ready → BP `Initialize`+`JoinChannel` runs once → pump starts → instructor sees video.
+2. **Switch-org mid-session (the bug repro).** From scenario 1, `ClearRegistration` → log shows `OnAgoraChannelChanged("")` → `StopVideoPump: stopped` → `Agora LeaveChannel ok`. Then `RedeemCode("5555555555")` → `OpenSocket → /api/token 200 channel=t-securitas-XXXX` → log shows `subsequent credentials → firing OnAgoraChannelChanged(t-securitas-XXXX)` → BP leaves the old channel, joins the new one, pump restarts → instructor on Securitas dashboard sees video.
+3. **Restart while already registered.** Stop PIE, start PIE → `Initialize: persisted=yes tenant=securitas` → same path as scenario 1 but with the persisted tenant. No re-prompt, video resumes immediately.
+
+**Side discovery: stale-INI gotcha worth pinning.** `DefaultGame.ini` had `ServerUrl="http://192.168.50.162:3000"` from a previous session's network. Current LAN IP was `192.168.0.119`. UE's `GConfig` is load-once-at-editor-startup; editing the source INI on disk does **not** hot-reload into the in-memory `GConfig` even across PIE sessions. The fix is just to restart the editor — `ReloadConfig <Class>` exists but only re-applies in-memory config to live instances, doesn't re-parse source INI files. Bumped the committed IP to the current LAN value as a chore; the long-term hygiene fix (per-dev override via `Saved/Config/Windows/Game.ini`, or mDNS `.local` hostname so the IP doesn't matter at all) is in the backlog rather than this commit's scope.
+
+**Things learned worth pinning.**
+
+- **`OnCredentialsReady` is a one-shot in BP-author mental model, not a stream.** The C++ implementation was firing it on every non-refresh `/api/token` success, which is correct from the "credentials are now ready" perspective but wrong from the BP "this is the cue to Initialize the Agora engine" perspective. Splitting into `OnCredentialsReady` (first-boot only) + `OnAgoraChannelChanged` (subsequent) is a clearer contract and is what we should have shipped originally.
+- **Agora 4.x `setExternalVideoSource` is engine-scope, but its *effective binding* to a local video track resets on `LeaveChannel`.** Calling `setExternalVideoSource(true)` once at app start and then `JoinChannel/LeaveChannel/JoinChannel` will silently stop publishing video on the second `JoinChannel`. The toggle-off-toggle-on pattern is the right cure; `RestartForNewChannel` makes that single-call from BP.
+- **The pump's "silent success" failure mode (everything green in logs, no video at the receiver) is the worst possible diagnostic surface.** Worth considering as a follow-up: log a periodic heartbeat on the pump side ("pushed N frames in last 5s") so a missing heartbeat on the receiver becomes a one-grep root-cause clue.
+
+**Net state.** Phase 6D + this fix are end-to-end stable on a single device for all three runtime paths (cold-boot-registered, register-mid-session, switch-org-mid-session). Yesterday's "next: 2-device test" item carries over — but the multi-device case is mostly de-risked by single-device validation since the headset-side state machine is now proven.
+
 ### Open Backlog Items
 
 - **Phase 4 Phases C–D — final BP integration:** (1) `WBP_PairingHUD` UMG widget showing the pairing code + connection state, added to viewport from BeginPlay; (2) `OnHeadsetCommand` bound graph on `BP_VRPawn` that switches on `Command` and fires per-command BP events (`pause_simulation` toggles `Set Game Paused`; others log to HUD).
 - **Phase 4 Phase E token refresh — BP wiring.** Bind Agora's `OnTokenPrivilegeWillExpire` → call `Get Signaling Subsystem → RefreshToken` → on the subsystem's `OnTokenRefreshed` delegate, call Agora's `renewToken` with the freshly-populated AgoraToken. C++ side is already wired; this is one BP graph edit.
 - **Phase 5:** broader instructor-facing polish (per-tenant branding, real session metadata from the headset rather than the stub).
-- **Phase 6 — Multi-tenant SaaS layer.** ~~Instructor authentication (Clerk/Auth0/Supabase Auth with `tenantId` JWT claim), customer admin page (Org dashboard + Organization Pairing Code generation), `POST /api/orgs/redeem` endpoint, persisted-tenantId storage on the headset side, server-side JWT-claim enforcement on all existing endpoints.~~ **Scope revised 2026-06-04** — OneBonsai already operates an internal app-management portal that mints + redeems organization registration codes for other in-house apps. Phase 6 becomes "hook into that portal" instead of "build a parallel customer admin page": persisted-tenantId on the headset side + first-launch UMG that calls the portal's `POST /api/register/redeem` + server-side JWT enforcement using the portal's auth tokens. The 4 instructor-overview embedding patterns (iframe / reverse-proxy / JS SDK / native port) are pre-architected in the 2026-06-04 Phase 6 scope-revision entry — current recommendation is "iframe first, reverse-proxy when iframe auth quirks bite."
+- **Phase 6 — Multi-tenant SaaS layer.** ~~Instructor authentication (Clerk/Auth0/Supabase Auth with `tenantId` JWT claim), customer admin page (Org dashboard + Organization Pairing Code generation), `POST /api/orgs/redeem` endpoint, persisted-tenantId storage on the headset side, server-side JWT-claim enforcement on all existing endpoints.~~ **Scope revised 2026-06-04; Phases A/B/C/D shipped 2026-06-04 through -05.** Server-side multi-tenant cookie auth + `tenant-codes.json` + login flow (A/B/C) and VR-side `UTenantRegistry` + persisted registration + mid-session channel-swap state machine (D + 2026-06-05 channel-swap fix) are all live and validated single-device. Remaining work: (1) swap `tenants.js::resolveByCode()` to call OneBonsai's existing portal endpoint when it's exposed (one-line `fetch()` change — the `tenant-codes.json` file *is* the contract spec for that integration); (2) pick + ship one of the 4 dashboard embedding patterns from the 2026-06-04 scope-revision entry (default trajectory: iframe first, subpath reverse-proxy when iframe auth quirks bite); (3) server hardening pre-prod (CORS lockdown, TLS, persistent DB for per-tenant Agora creds via the `getAgoraCredentials(tenantId)` seam that already exists); (4) the 2-device validation test (Quest=Securitas, Pico=CustomerX, two browser instructors see fully separated grids) — mostly de-risked by single-device validation but worth doing once both devices are charged and to hand.
 - Rename `VRPawn` → `BP_VRPawn` to match `.cursorrules §4.2` naming convention (cosmetic refactor; not urgent).
 - Re-color the four Phase 2 Print Strings (currently all yellow) — green/red/cyan/yellow for join/error/peer-join/leave readability.
 - Tighten Socket.IO CORS before any LAN/internet-facing deploy (currently permissive for development).
 - Implicit-room server fallback: if a peer publishes on `t-<tenant>-XXXX` with no matching room, auto-create one so real headsets can show up in the grid even without the stub. Eliminates stub-mode entirely.
+- **Video pump heartbeat log.** Periodic `Display`-level log on `UAgoraVideoPump` ("pushed N frames in last 5s, ~M Hz") so a missing heartbeat on the receiver becomes a one-grep root-cause clue when the pump silently succeeds but no frames arrive (the failure mode that masked the 2026-06-05 channel-swap bug for a full repro cycle). Cheap to add; high diagnostic ROI.
+- **Per-developer `ServerUrl` override** to avoid committing a specific LAN IP in `DefaultGame.ini`. Two options: (1) ship a documented `Saved/Config/Windows/Game.ini` template and `.gitignore` the real file; (2) switch the default to an mDNS `.local` hostname so the IP doesn't matter at all. Picking (2) also fixes the Quest-side cross-network case since libcurl on Quest 3 resolves `.local` via Bonjour out of the box.
 - Meta-store-compliant build flavour: separate `Config/Android_Meta/AndroidEngine.ini` overlay that flips `MinSDKVersion=32`, disables PICOXR, restores Meta-only manifest entries — required if/when we publish to the official Meta store. Universal sideload APK remains the dev default.
 - OpenXR localization warnings in the Output Log (low priority cosmetic).
 - 10-bit swapchain fallback messages (low priority cosmetic).

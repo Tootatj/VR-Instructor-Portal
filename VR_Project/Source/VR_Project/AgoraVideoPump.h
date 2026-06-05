@@ -71,6 +71,32 @@ public:
     UFUNCTION(BlueprintCallable, Category = "Agora|VideoPump")
     void StopVideoPump();
 
+    /**
+     * Tear down + re-establish the external-video-source binding and the
+     * pump timer. Required after Agora's local video track lifecycle is
+     * reset — which happens whenever the BP graph does LeaveChannel +
+     * JoinChannel (e.g. mid-session tenant swap driven by
+     * USignalingSubsystem::OnAgoraChannelChanged).
+     *
+     * Why a wrapper instead of asking BP to call Stop+Start back-to-back:
+     *   - Single semantically clear BP node ("the channel changed,
+     *     restart the pump") that's hard to misuse.
+     *   - Internally calls StopVideoPump (drains in-flight readback +
+     *     calls setExternalVideoSource(false)) then StartVideoPump
+     *     (re-fetches IMediaEngine, re-calls setExternalVideoSource(true),
+     *     re-arms the 30 Hz timer). The setExternalVideoSource(false→true)
+     *     toggle is what actually re-binds the external source to the
+     *     newly-created local video track of the new channel; calling only
+     *     StartVideoPump when already running is a no-op and would NOT fix
+     *     the binding.
+     *
+     * Idempotent and safe to call from any BP point; just runs Stop+Start
+     * even if the pump wasn't running (Start handles missing SourceRT etc.
+     * with a logged error and an early return).
+     */
+    UFUNCTION(BlueprintCallable, Category = "Agora|VideoPump")
+    void RestartForNewChannel();
+
 protected:
     virtual void EndPlay(const EEndPlayReason::Type EndPlayReason) override;
 

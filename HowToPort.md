@@ -1,6 +1,6 @@
 # How to Port the VR Instructor Portal into Another Unreal Project
 
-> **Last verified against:** UE 5.5.4 · PICOXR 3.4.1 · SocketIOClient v2.9.0 · Agora-Unreal-RTC-SDK v4.5.1 · `USignalingSubsystem` + `UTenantRegistry` git rev `8e1c8b6`
+> **Last verified against:** UE 5.5.4 · PICOXR 3.4.1 · SocketIOClient v2.9.0 · Agora-Unreal-RTC-SDK v4.5.1 · `USignalingSubsystem` + `UTenantRegistry` git rev `<this commit>` (channel-swap fix)
 >
 > **Maintainer rule:** every time `SignalingSubsystem.h/.cpp`, `TenantRegistry.h/.cpp`,
 > the BP integration shape on `BP_VRPawn`, or the plugin set changes, update
@@ -26,7 +26,7 @@ porting work below is entirely about the Unreal side.
 | `SignalingSubsystem.h/.cpp` | **Drop-in.** Zero dependency on this project's pawn, scene, or Agora. Pure UE + Socket.IO + HTTP. |
 | `TenantRegistry.h/.cpp` | **Drop-in.** Pure UE + HTTP + `FFileHelper`. Owns the first-launch company-code redemption + persistence. **Replaces any prior hardcoded `TenantId` in INI.** Has no UMG dependency — host apps can use their existing in-VR code-input panel (see *BYO code-input UI* section below). |
 | `Web_Dashboard/` server | **Already portable.** Runs once, serves any UE app that speaks the wire protocol. |
-| BP integration on `BP_VRPawn` | **Pattern, not asset.** Reproduce the 3 (now 4 — registration gate) graphs in the target project's pawn or game mode. Worked example included. |
+| BP integration on `BP_VRPawn` | **Pattern, not asset.** Reproduce the 5 graphs in the target project's pawn or game mode (first-boot init + signaling-ready gate + registration-gate spawn + `OnAgoraChannelChanged` swap handler + `OnJoinChannelSuccess` pump restart). Worked example included. |
 | Agora streaming pipeline (`AgoraVideoPump.h/.cpp` + Agora plugin) | **Optional / copyable.** Only needed if the target project has no streaming and you want this stack to provide it. |
 | PICOXR + universal-VR config | **Drop-in via** [`VR_Project/Plugins/README.md`](VR_Project/Plugins/README.md). Same recipe regardless of target. |
 
@@ -133,7 +133,7 @@ bEnablePSensor=True
 
 ### A.4. Wire the target's pawn (or wherever Agora joins the channel)
 
-Three graph edits, all on the BP that owns the `Initialize` → `Make RtcEngineContext`
+Four graph edits, all on the BP that owns the `Initialize` → `Make RtcEngineContext`
 → `Join Channel` chain:
 
 1. **Add `OnSignalingReady` custom event.** Drag the existing Agora init
@@ -150,9 +150,57 @@ Three graph edits, all on the BP that owns the `Initialize` → `Make RtcEngineC
    `Get Signaling Subsystem → AgoraAppId` into the `AppId` pin. On
    `Join Channel`, drag `AgoraChannel` into `ChannelId` and `AgoraToken`
    into `Token`. Delete the literal strings.
+4. **Handle mid-session tenant swap.** Bind a separate handler to the
+   subsystem's `OnAgoraChannelChanged(NewChannel)` delegate. This fires
+   on `ClearRegistration` (with `NewChannel=""`) and on every subsequent
+   `RedeemCode` (with the new channel name). The handler tears down the
+   current Agora channel and rejoins the new one, restarting the video
+   pump in between. See *A.4.1* below for the exact graph shape and
+   the design rationale.
 
 Reference implementation: `VR_Project/Content/VRTemplate/Blueprints/VRPawn.uasset`
-(open the asset, look at `BeginPlay` and the `OnSignalingReady` custom event).
+(open the asset; relevant graphs are `BeginPlay`, the `OnSignalingReady`
+custom event, and the `On Agora Channel Changed` handler).
+
+### A.4.1. The channel-swap handler (required even if you never use switch-org today)
+
+`OnCredentialsReady` is one-shot in the BP-author mental model: it fires
+when the headset *first* has Agora credentials, and your graph reacts by
+calling `RtcEngine.Initialize` + `JoinChannel`. **`OnCredentialsReady` does
+NOT fire again on subsequent registrations** — that path goes through
+`OnAgoraChannelChanged` instead. If you skip wiring `OnAgoraChannelChanged`
+and a user ever triggers a re-registration (switch-org from a pause menu,
+or even a server-side re-issue of credentials during a long session), the
+old Agora channel stays joined, the new channel gets no published local
+video, and the instructor sees a black tile. Found and fixed 2026-06-05
+— full diagnosis in Devlog "channel-swap fix" entry.
+
+The minimum-viable handler:
+
+```
+On Agora Channel Changed (NewChannel : String)
+  ├─ Branch [NewChannel == ""]
+  │    True  → VideoPump.StopVideoPump → Agora.LeaveChannel
+  │    False → VideoPump.StopVideoPump
+  │             └─ Agora.LeaveChannel
+  │                └─ Agora.JoinChannel(
+  │                      NewChannel,
+  │                      Signaling.AgoraToken,
+  │                      Signaling.AgoraUid)
+
+Agora OnJoinChannelSuccess (existing event, add one node)
+  └─ VideoPump.RestartForNewChannel
+       (idempotent; safe to also call on the first-boot join — Stop
+        early-exits if nothing's running)
+```
+
+The `RestartForNewChannel` call after `JoinChannel` is what cures the
+silent failure: it cycles `setExternalVideoSource(false)` → `(true)`
+inside the pump, rebinding the external frame source to the *new*
+channel's freshly-created local video track. `setExternalVideoSource` is
+engine-scope in Agora 4.x but its effective binding to a local track
+resets on `LeaveChannel`, so a plain `StartVideoPump` (which is a no-op
+when already running) won't fix it. Always go through `RestartForNewChannel`.
 
 ### A.5. Cook + sideload + verify
 
@@ -291,7 +339,8 @@ design.
 The minimum wiring on the host app side:
 
 1. **Drop in the C++ files** (Recipes A.2 + A.3 above).
-2. **In your existing panel's submit handler BP graph:**
+2. **Follow Recipe A.4 + A.4.1 verbatim** on whichever BP owns your Agora `JoinChannel` call (pawn, game mode, controller — wherever you have it today). The pawn-side wiring is *universal* — your own code-input panel only replaces the `WBP_RegistrationGate` widget, not the channel-lifecycle BP graphs. In particular, if your host app supports any "switch organization" affordance mid-session, the *A.4.1* channel-swap handler is mandatory; without it you'll silently lose video on the new tenant.
+3. **In your existing panel's submit handler BP graph:**
 
    ```
    [On Submit Clicked]
@@ -303,7 +352,7 @@ The minimum wiring on the host app side:
                 On bSuccess=false → display ErrorMessage in your existing error label
    ```
 
-3. **Bind `OnRegistrationChanged` once at panel-construct time** to handle the case where the registration is wiped at runtime (e.g. via your existing "switch organization" / "log out" affordance):
+4. **Bind `OnRegistrationChanged` once at panel-construct time** to handle the case where the registration is wiped at runtime (e.g. via your existing "switch organization" / "log out" affordance):
 
    ```
    [Construct]
@@ -312,7 +361,7 @@ The minimum wiring on the host app side:
             On fire → if IsRegistered() == false: show your panel again
    ```
 
-4. **No other panel changes needed.** The host app's existing scene start
+5. **No other panel changes needed.** The host app's existing scene start
    logic should already be gated on "have we got a tenant?" somewhere
    if the existing system worked at all — just route that gate through
    `UTenantRegistry::IsRegistered()` instead of whatever local flag it
@@ -352,6 +401,8 @@ have to dig:
 6. **`MinSDKVersion=29`** for any APK targeting both Quest and Pico 4 Enterprise. Pico 4E runs PICO OS on Android 10 = API 29. Meta's API 32 floor is a *store* check only, not an install-time check; sideloaded universal APKs install fine on Quest with MinSDK=29.
 7. **First cold cook with these plugins takes ~2 extra minutes** (compiling Socket.IO's bundled C++ libs: asio, rapidjson, websocketpp). Subsequent cooks reuse the built artifacts. Don't panic on the first build.
 8. **`UGameInstanceSubsystem` init order is non-deterministic.** `USignalingSubsystem::Initialize` calls `Collection.InitializeDependency(UTenantRegistry::StaticClass())` to guarantee the registry has loaded its persisted JSON before the resolved tenantId is read. Don't remove that call. Without it, a fresh boot races: half the time signaling reads an empty registry, falls through to the INI tenant, and the device ends up wrong-tenant-bound for the session.
+9. **`OnCredentialsReady` fires once per app lifetime; subsequent registrations fire `OnAgoraChannelChanged` instead.** If your BP `OnCredentialsReady` graph calls `RtcEngine.Initialize` + `JoinChannel`, do NOT also bind it for the mid-session swap case — Agora 4.x doesn't auto-leave the old channel, the local video track from the first channel persists, and the new channel ends up with no published video (instructor sees a black tile, your pump logs success). Wire a separate handler for `OnAgoraChannelChanged` per *A.4.1* above. Full diagnosis in Devlog 2026-06-05 "channel-swap fix".
+10. **UE's `GConfig` is load-once-at-editor-startup.** Editing source INI files on disk does NOT hot-reload into the in-memory `GConfig` even across PIE sessions — your changes only take effect after an editor restart. `ReloadConfig <Class>` exists but only re-applies in-memory config to live instances; it doesn't re-parse the source files. If a `ServerUrl` / `bAllowUnregisteredBoot` / etc. change appears to be ignored, restart the editor before assuming the code is broken. (Commonly bites when the dev's LAN IP changes — see the Devlog 2026-06-05 "side discovery" note.)
 
 ---
 
@@ -395,5 +446,6 @@ Append a row when this guide's prescriptions change (new plugin, BP shape change
 
 | Date | Commit | What changed |
 |---|---|---|
-| 2026-06-04 | `<this commit>` | Phase 6D: added `UTenantRegistry` (first-launch code-redemption subsystem with persisted tenant binding); new INI block `[/Script/<Module>.TenantRegistry]`; new *BYO code-input UI* section for host apps that already have a registration panel; new gotcha #8 about `InitializeDependency` ordering between signaling and registry. |
+| 2026-06-05 | `<this commit>` | Phase 6D channel-swap fix: new `USignalingSubsystem::OnAgoraChannelChanged(NewChannel)` delegate + `UAgoraVideoPump::RestartForNewChannel()` BP-callable. Recipe A.4 grew a 4th BP wiring step + new *A.4.1* subsection documenting the swap handler graph and the underlying Agora-channel-binding rationale. New gotcha #9 (`OnCredentialsReady` is first-boot only) and #10 (`GConfig` is load-once-at-editor-startup). TL;DR table updated from "4 graphs" to "5 graphs". |
+| 2026-06-04 | `26fefa1` | Phase 6D: added `UTenantRegistry` (first-launch code-redemption subsystem with persisted tenant binding); new INI block `[/Script/<Module>.TenantRegistry]`; new *BYO code-input UI* section for host apps that already have a registration panel; new gotcha #8 about `InitializeDependency` ordering between signaling and registry. |
 | 2026-06-04 | `d65bc98` | Initial guide. Covers `USignalingSubsystem` (rev `d65bc98`), PICOXR 3.4.1 + duplicate-method patch, AgoraVideoPump (Recipe B), 7 common gotchas, future-plugin proposal. |

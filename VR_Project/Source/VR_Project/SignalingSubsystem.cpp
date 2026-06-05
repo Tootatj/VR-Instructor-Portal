@@ -219,6 +219,15 @@ void USignalingSubsystem::HandleRegistrationChanged()
         // PairingCode kept — it's already random per cold launch and
         // doesn't leak anything. A re-register will reuse it.
         SetState(ESignalingState::Disconnected);
+
+        // Tell streaming side to leave the (now-orphaned) Agora channel and
+        // stop pushing video. Only meaningful if we previously had credentials
+        // — on a never-registered boot the BP never joined a channel, so
+        // there's nothing for it to leave.
+        if (bHasFiredInitialCredentials)
+        {
+            OnAgoraChannelChanged.Broadcast(FString());
+        }
         return;
     }
 
@@ -497,10 +506,28 @@ void USignalingSubsystem::FetchToken(bool bIsRefresh)
 
             if (bWasRefresh)
             {
+                // Token rotation within the same channel — BP renews and
+                // stays joined. No channel change.
                 Self->OnTokenRefreshed.Broadcast();
+            }
+            else if (Self->bHasFiredInitialCredentials)
+            {
+                // Subsequent non-refresh credentials = registry-driven
+                // channel swap (tenant change, or re-register after a
+                // ClearRegistration). BP's first-boot init graph already
+                // ran on the original credentials; firing OnCredentialsReady
+                // again would double-Initialize the Agora engine. Route
+                // through the channel-swap delegate instead — BP is
+                // expected to LeaveChannel + JoinChannel(AgoraChannel) +
+                // restart the video pump.
+                UE_LOG(LogVRIPSignaling, Log,
+                    TEXT("/api/token: subsequent credentials → firing OnAgoraChannelChanged(%s)"),
+                    *Self->AgoraChannel);
+                Self->OnAgoraChannelChanged.Broadcast(Self->AgoraChannel);
             }
             else
             {
+                Self->bHasFiredInitialCredentials = true;
                 Self->OnCredentialsReady.Broadcast();
             }
         });
