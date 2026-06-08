@@ -699,6 +699,37 @@ events/month), metrics via Fly's built-in dashboard or Prometheus +
 Grafana on the VPS. Scale these to OneBonsai's existing observability
 stack — don't reinvent.
 
+### D.9. Agora cost-exposure mitigations (cross-side, before any real customer traffic)
+
+This category spans both sides of the deploy and is easy to miss.
+The clean-exit paths (headset `Deinitialize`, browser `beforeunload`,
+30-min token TTL safety net) are solid, but several "left on" /
+"backgrounded" / "no subscribers" cases burn billable Agora minutes
+invisibly. Full diagnosis + sized line items in the 2026-06-08
+"Agora cost-exposure mitigations" backlog entry in
+[`Devlog.md`](Devlog.md).
+
+**Minimum required before pointing real headsets at the production URL:**
+- Set an Agora console billing alert (`https://console.agora.io` →
+  Billing → set monthly threshold). 5 minutes; doesn't prevent anything,
+  but turns "discovered from invoice" into "alerted before damage compounds."
+- Coordinate with the VR developer to wire `IXRTrackingSystem::GetHMDWornState()`
+  detection on `BP_VRPawn` — after ~2 min of `NotWorn`, headset should
+  `LeaveChannel` + emit `headset:end`. ~3 hours of VR-side BP work.
+  Eliminates the dominant cost path (Quest's proximity sleep doesn't
+  stop the app, so we publish into a sleeping headset indefinitely
+  without this).
+- Add a `visibilitychange` handler in `grid.js` that unsubscribes
+  visible tiles when the tab is hidden, resubscribes on visible.
+  ~1 hour, web-side only. Catches the "instructor left a tab open over
+  the weekend" case.
+
+These three together are ~4-5 hours of work and bound the realistic
+"forgotten headset" / "forgotten tab" cost exposure to single-digit
+dollars/month even at fleet scale. Skipping them means a single
+overnight-forgotten classroom of 20 devices can burn ~$15-60 depending
+on duration before the token TTL safety net kicks in.
+
 ---
 
 ## Integration touchpoint with the VR side
@@ -844,4 +875,5 @@ Append a row when this guide's prescriptions change (new recipe, new gotcha lear
 
 | Date | Commit | What changed |
 |---|---|---|
-| 2026-06-08 | `<this commit>` | Initial guide. Four recipes (A: PaaS / B: VPS / C: subpath-embedded / D: hardening checklist), integration-touchpoint section with the VR developer, 10 common gotchas pinned in advance, operational topics (tenant management / backups / updates / monitoring / cred rotation). Created because `HowToPort.md` explicitly disclaims web deploy and the Web_Dashboard/README.md only covers local dev — a web-developer handoff needed a parallel doc. |
+| 2026-06-08 | `<this commit>` | Added section D.9 (Agora cost-exposure mitigations) to the hardening checklist after the audit captured in Devlog 2026-06-08. Spans both sides of the deploy (headset HMD-worn-state idle detection + browser visibilitychange unsubscribe) so the web dev doing the deploy doesn't miss the VR-side coordination point. |
+| 2026-06-08 | `41b3744` | Initial guide. Four recipes (A: PaaS / B: VPS / C: subpath-embedded / D: hardening checklist), integration-touchpoint section with the VR developer, 10 common gotchas pinned in advance, operational topics (tenant management / backups / updates / monitoring / cred rotation). Created because `HowToPort.md` explicitly disclaims web deploy and the Web_Dashboard/README.md only covers local dev — a web-developer handoff needed a parallel doc. |
