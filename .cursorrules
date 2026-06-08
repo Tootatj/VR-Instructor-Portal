@@ -334,15 +334,39 @@ Rules:
    "Always allow from this computer".
 4. `adb devices` lists the headset serial with status **`device`**
    (not `unauthorized`, not `offline`, not missing).
+5. PowerShell execution policy allows running unsigned local scripts —
+   the canonical cook entry point (`Tools/Cook-VRApp.ps1`) is unsigned.
+   One-time setup: `Set-ExecutionPolicy -Scope CurrentUser RemoteSigned`.
+   Per-invocation alternative: `powershell -ExecutionPolicy Bypass -File
+   .\Tools\Cook-VRApp.ps1 ...`. (Bypassing globally with `-Scope
+   LocalMachine Unrestricted` is **not** recommended — keeps the
+   "remote scripts must be signed" half of the protection.)
 
-If any of the four conditions fails, **stop and report** — do not attempt
+If any of the five conditions fails, **stop and report** — do not attempt
 the build, because `-deploy -run` will fail late and waste a full cook.
 
-## 8.2 The Canonical UAT Command (verbatim — do not modify)
+## 8.2 The Canonical Build Pipeline
 
-Run from the `/VR_Project/` directory in a **Windows Command Prompt**
-(not PowerShell — `%CD%` expansion differs). If invoked from PowerShell,
-wrap with `cmd /c "<command>"` to preserve `%CD%` semantics.
+**Use the per-device cook wrapper as the entry point:**
+
+    .\Tools\Cook-VRApp.ps1 -Device quest        # cook + deploy to Quest 3
+    .\Tools\Cook-VRApp.ps1 -Device pico         # cook + deploy to Pico 4 Enterprise
+    .\Tools\Cook-VRApp.ps1                      # auto-detect from `adb devices`
+
+The wrapper exists because Quest and Pico require different
+`[HMDPluginPriority]` blocks in `DefaultEngine.ini` (Quest needs
+`OpenXR=10, PICOXRHMD=0`; Pico needs `OpenXR=0, PICOXRHMD=10` — see
+Devlog 2026-06-08 for the full diagnosis of why neither value works
+universally on PICO OS 5+). The wrapper temporarily mutates the INI
+for the duration of one cook, runs UAT verbatim per the command
+below, restores the INI via a guaranteed `try/finally` block, and
+renames the produced APK to `VR_Project-Quest-arm64.apk` /
+`VR_Project-Pico-arm64.apk` so both vendors' APKs co-exist on disk.
+
+**Underlying UAT command** (what the wrapper invokes — preserved verbatim
+here as the authoritative reference). Run from `/VR_Project/` in a
+**Windows Command Prompt** (not PowerShell — `%CD%` expansion differs).
+If invoked from PowerShell, wrap with `cmd /c "<command>"`.
 
     "C:\Program Files\Epic Games\UE_5.5\Engine\Build\BatchFiles\RunUAT.bat" ^
       BuildCookRun ^
@@ -354,6 +378,13 @@ wrap with `cmd /c "<command>"` to preserve `%CD%` semantics.
       -archivedirectory="%CD%\Build" ^
       -deploy -run
 
+Only invoke this command directly when (a) debugging the wrapper
+itself, (b) the dev's only test device is connected and they've
+already confirmed the INI's baseline `[HMDPluginPriority]` matches
+that device (baseline is Quest), or (c) reproducing a UAT-side issue
+in isolation. Otherwise use the wrapper — it eliminates a class of
+"wrong APK installed" / "INI left flipped after a crash" mistakes.
+
 ## 8.3 Flag Reference
 - `-build`     : Generates editor targets and compiles native runtime modules.
 - `-cook`      : Bakes project assets into mobile-optimized formats (ASTC).
@@ -364,16 +395,23 @@ wrap with `cmd /c "<command>"` to preserve `%CD%` semantics.
 - `-run`       : Launches the app on the headset after install.
 
 ## 8.4 Variants (only use when explicitly requested)
-- **Package only, no device push** — drop `-deploy -run`. Useful when no
-  headset is connected or when producing a build for sideload elsewhere.
-- **Shipping config** — replace `-clientconfig=Development` with
-  `-clientconfig=Shipping` for release builds. Expect longer compile and
-  smaller APK with no debug symbols. Do not use for daily iteration.
+- **Package only, no device push** — `.\Tools\Cook-VRApp.ps1 -Device <d> -NoDeploy`.
+  Drops `-deploy -run` from the UAT command. Useful when no headset is
+  connected or when producing a build for sideload elsewhere.
+- **Shipping config** — `.\Tools\Cook-VRApp.ps1 -Device <d> -Configuration Shipping`.
+  Expect longer compile and smaller APK with no debug symbols. Do not
+  use for daily iteration.
 - **Clean build** — prepend a manual delete of
   `VR_Project\Binaries\`, `VR_Project\Intermediate\`,
   `VR_Project\Saved\StagedBuilds\`, and `VR_Project\Build\` only when
   the user explicitly asks for a clean rebuild. Never delete
   `DerivedDataCache/` automatically (very expensive to repopulate).
+- **Validate the wrapper without burning a cook** —
+  `.\Tools\Cook-VRApp.ps1 -Device pico -DryRun`. Mutates + restores the
+  INI without invoking UAT. Run after editing the wrapper or after a
+  failed cook that left you wondering whether the restore semantics
+  held (the script's `git status` pre-flight check is also a safety
+  net there).
 
 ## 8.5 Known Failure Signatures → Resolutions
 Reference the Devlog `System Remediation History` section for full
@@ -388,13 +426,22 @@ context. Short triage table:
 | `adb devices` shows headset as `unauthorized`              | USB debug dialog not accepted on headset    | §8.1                |
 
 ## 8.6 Output Artifacts
-On success, the deployable APK and its companion files land in:
+On success, the deployable APK lives at:
+
+    /VR_Project/Binaries/Android/VR_Project-Quest-arm64.apk      (Quest cook)
+    /VR_Project/Binaries/Android/VR_Project-Pico-arm64.apk       (Pico cook)
+
+(The wrapper renames UE's default `VR_Project-arm64.apk` to one of the
+above after a successful UAT run, so both vendors' APKs co-exist on
+disk without overwriting each other.)
+
+Staging + archive companion files land in:
 
     /VR_Project/Build/Android_ASTC/
 
-The headset will already have the APK installed and the template map
-running. Confirm by tailing the last lines of the UAT log for
-`BUILD SUCCESSFUL` and `Deploy Time: ...` markers.
+When `-NoDeploy` is omitted (the default), the headset already has the
+APK installed and the template map running. Confirm by tailing the last
+lines of the UAT log for `BUILD SUCCESSFUL` and `Deploy Time: ...` markers.
 
 
 # ============================================================================
