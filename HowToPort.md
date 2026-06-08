@@ -435,10 +435,11 @@ and this `HowToPort.md` collapses to a one-screen plugin install guide.
 ## Related project docs
 
 - [`README.md`](README.md) — top-level project overview + per-host setup.
+- [`HowToDeploy.md`](HowToDeploy.md) — counterpart of this guide: how to deploy the web dashboard to a public domain. The web developer's handoff doc. Together this and `HowToDeploy.md` form the full UE-app + web-stack handoff package.
 - [`Devlog.md`](Devlog.md) — session-by-session decisions and lessons. Search for "Phase 4 Phase A" / "Phase B" / "Pico VR Phase A" entries for the deepest detail on every line of the signaling layer.
 - [`.cursorrules`](.cursorrules) — master technical contract: wire protocol, performance bars, build commands.
 - [`VR_Project/Plugins/README.md`](VR_Project/Plugins/README.md) — plugin install recipes (Agora / SocketIOClient / PICOXR).
-- [`Web_Dashboard/README.md`](Web_Dashboard/README.md) — server API surface table.
+- [`Web_Dashboard/README.md`](Web_Dashboard/README.md) — server API surface table + local-dev setup.
 
 ---
 

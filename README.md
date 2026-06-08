@@ -8,10 +8,11 @@ WebRTC, talks bidirectionally, and dispatches JSON commands.
 
 For full architecture, conventions, and performance constraints see
 [`.cursorrules`](.cursorrules). For session-by-session progress, decisions,
-and rollbacks see [`Devlog.md`](Devlog.md). To reuse the signaling +
-streaming layer in a different UE project (e.g., a different OneBonsai
-training app that should also be streamable into the instructor
-dashboard), see [`HowToPort.md`](HowToPort.md).
+and rollbacks see [`Devlog.md`](Devlog.md).
+
+For handoff-style "how to take this somewhere new" recipes:
+- **Reusing the signaling layer in a different UE training app** (VR developer's recipe) → [`HowToPort.md`](HowToPort.md)
+- **Deploying the web dashboard to a public domain** (web developer's recipe) → [`HowToDeploy.md`](HowToDeploy.md)
 
 ## Repository layout
 
@@ -19,8 +20,10 @@ dashboard), see [`HowToPort.md`](HowToPort.md).
 .cursorrules        Master technical contract (architecture, conventions, perf bars)
 Devlog.md           Operational ledger (session notes, decisions, rollbacks, backlog)
 HowToPort.md        Recipe for reusing this project's signaling layer in another UE app
+HowToDeploy.md      Recipe for deploying the web dashboard to a public domain (TLS, hardening, hosting options)
 VR_Project/         Unreal Engine 5.5.4 mobile VR client
-Web_Dashboard/      Node.js + Express + Socket.IO server + vanilla-JS SPA (not yet scaffolded)
+Web_Dashboard/      Node.js + Express + Socket.IO signaling server + vanilla-JS instructor SPA
+Tools/              Per-device cook wrapper (Cook-VRApp.ps1) + future build/deploy scripts
 ```
 
 ## Prerequisites
@@ -82,39 +85,48 @@ CI runner must install it manually before opening the project:
 If UE refuses to launch with a "missing modules" error, Visual Studio's
 "Game development with C++" workload is not installed (see Prerequisites).
 
-## Build and deploy to Quest
+## Build and deploy to a headset
 
-The canonical UAT command is documented verbatim in
-[`.cursorrules` §8.2](.cursorrules). Quick reference (run from `VR_Project/`
-in a **Windows Command Prompt** — *not* PowerShell, because `%CD%` expansion
-differs):
+**Use the per-device cook wrapper as the entry point** (handles the per-vendor
+`[HMDPluginPriority]` mutation + APK renaming automatically):
 
-```bat
-"C:\Program Files\Epic Games\UE_5.5\Engine\Build\BatchFiles\RunUAT.bat" ^
-  BuildCookRun ^
-  -project="%CD%\VR_Project.uproject" ^
-  -targetplatform=Android ^
-  -cookflavor=ASTC ^
-  -clientconfig=Development ^
-  -build -cook -stage -package -archive ^
-  -archivedirectory="%CD%\Build" ^
-  -deploy -run
+```powershell
+.\Tools\Cook-VRApp.ps1 -Device quest         # cook + deploy to Quest 3
+.\Tools\Cook-VRApp.ps1 -Device pico          # cook + deploy to Pico 4 Enterprise
+.\Tools\Cook-VRApp.ps1                       # auto-detect from `adb devices`
 ```
 
-Pre-flight checks (verify *before* invoking the build — see
-[`.cursorrules` §8.1](.cursorrules)):
+See [`.cursorrules` §8](.cursorrules) for the full pipeline (pre-flight
+requirements, the underlying verbatim UAT command, flag reference, build
+variants, output artifact paths, and the known-failure-signature triage
+table). The wrapper exists because Quest and Pico require different
+`[HMDPluginPriority]` blocks at cook time — see the Devlog 2026-06-08
+follow-up entry for the rationale.
+
+Pre-flight (verify *before* invoking the wrapper):
 
 1. Headset connected via a USB-C **data** cable (charge-only cables will not enumerate).
 2. Developer Mode toggled on in the device's mobile companion app.
 3. USB debugging authorized on the headset screen.
 4. `adb devices` lists the headset with status `device` (not `unauthorized`, not `offline`).
-
-See [`.cursorrules` §8](.cursorrules) for the full flag reference, build
-variants, and the known-failure-signature triage table.
+5. PowerShell execution policy allows running unsigned local scripts —
+   one-time setup: `Set-ExecutionPolicy -Scope CurrentUser RemoteSigned`.
 
 ## Web Dashboard
 
-Not yet scaffolded. The signaling server (Node + Express + Socket.IO) and
-instructor SPA (vanilla JS / HTML / CSS) are fully specified in
-[`.cursorrules` §3, §4.3, §5](.cursorrules), but the `Web_Dashboard/`
-directory does not yet exist on disk.
+The signaling server (Node 20+ / Express / Socket.IO) and the instructor
+SPA (vanilla JS / HTML / CSS, served by the same Express app) live under
+`Web_Dashboard/`. As of Phase 6 it ships multi-tenant cookie auth, the
+OneBonsai-style 3×2 grid view with per-tile focus mode + command deck,
+a code-based login flow, and a canvas-published faker tool for testing
+the grid without N physical headsets.
+
+For local development setup, see [`Web_Dashboard/README.md`](Web_Dashboard/README.md)
+— install Node, copy `.env.example`, `npm run dev`, open `http://localhost:3000`,
+and run the 2-minute end-to-end smoke test documented there.
+
+For deploying the dashboard to a public domain (staging or production),
+see [`HowToDeploy.md`](HowToDeploy.md) — covers PaaS (Fly.io / Railway),
+VPS (Hetzner / DigitalOcean + Caddy + systemd), and subpath-embedded
+patterns, plus the 8-item production-required hardening checklist and
+the integration contract with the VR side.

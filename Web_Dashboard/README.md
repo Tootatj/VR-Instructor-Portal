@@ -3,6 +3,10 @@
 Signaling server, Agora token minter, and instructor SPA for the
 VR Instructor Portal. Per `.cursorrules` §3 / §4.3 / §4.3.1 / §5.
 
+> **Scope of this README:** local development setup, the full API + Socket.IO surface table, and end-to-end smoke tests. Read this first — every other doc assumes you've validated the system locally.
+>
+> **Deploying to a public domain?** This README does not cover that. See [`../HowToDeploy.md`](../HowToDeploy.md) for the recipe-style guide covering TLS, reverse proxies, hosting options (PaaS / VPS / portal-embedded), the production-required hardening checklist, and the integration contract with the VR developer.
+
 ## Layout on disk
 
 ```
