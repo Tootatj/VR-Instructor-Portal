@@ -37,3 +37,7 @@ Web_Dashboard/.env
 # OS generated files
 .DS_Store
 Thumbs.db
+
+# Per-cook build logs (large UAT/cook stdout dumps tee'd by Tools/Cook-VRApp.ps1).
+# Kept on disk for local diagnostics, not source-controlled.
+Tools/last-cook-*.log

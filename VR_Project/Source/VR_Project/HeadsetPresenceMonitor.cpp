@@ -5,6 +5,7 @@
 #include "TimerManager.h"
 #include "IXRTrackingSystem.h"
 #include "IHeadMountedDisplay.h"
+#include "Misc/CoreDelegates.h"
 
 DEFINE_LOG_CATEGORY_STATIC(LogVRIPPresence, Log, All);
 
@@ -20,11 +21,34 @@ void UHeadsetPresenceMonitor::BeginPlay()
 {
     Super::BeginPlay();
 
+    // PRIMARY path: bind to UE's app-lifecycle delegates. On Quest these
+    // fire on take-off (Deactivate) and put-back-on (Reactivate) BEFORE
+    // the OS suspends the game thread — the only way to reliably emit
+    // headset:end + LeaveChannel on Quest because FTimerManager stops
+    // ticking shortly after take-off (diagnosed 2026-06-11 — Devlog
+    // entry "Agora cost-exposure Phase 1 — fix").
+    //
+    // The delegates also fire on system overlays (Quest universal menu,
+    // Guardian setup, etc.). We treat those the same as take-off — pause
+    // publishing for the overlay's duration, auto-resume on close. This
+    // is slightly more aggressive than strictly necessary but pushes the
+    // cost arrow in the right direction (saves minutes during overlays)
+    // and the UX impact is small (~1 s tile flicker in the dashboard on
+    // brief overlays).
+    DeactivateDelegateHandle = FCoreDelegates::ApplicationWillDeactivateDelegate.AddUObject(
+        this, &UHeadsetPresenceMonitor::HandleApplicationWillDeactivate);
+    ReactivateDelegateHandle = FCoreDelegates::ApplicationHasReactivatedDelegate.AddUObject(
+        this, &UHeadsetPresenceMonitor::HandleApplicationHasReactivated);
+
+    // FALLBACK path: pull-based worn-state polling on a timer. Useful for
+    // desktop dev (PIE / non-VR Editor) where the deactivate delegates
+    // don't fire on simple alt-tab, and as a defensive backstop on any
+    // vendor whose OS doesn't fire the lifecycle delegates reliably.
     UWorld* World = GetWorld();
     if (!World)
     {
         UE_LOG(LogVRIPPresence, Warning,
-            TEXT("BeginPlay: no UWorld — presence monitoring disabled."));
+            TEXT("BeginPlay: no UWorld — polling path disabled (delegates still bound)."));
         return;
     }
 
@@ -33,17 +57,78 @@ void UHeadsetPresenceMonitor::BeginPlay()
         PollIntervalSeconds, /*bLoop*/ true);
 
     UE_LOG(LogVRIPPresence, Log,
-        TEXT("BeginPlay: poll=%.0fs idle-threshold=%.0fs unknown-as-worn=%d"),
+        TEXT("BeginPlay: poll=%.0fs idle-threshold=%.0fs unknown-as-worn=%d (delegates: deactivate+reactivate bound)"),
         PollIntervalSeconds, IdleThresholdSeconds, bTreatUnknownAsWorn ? 1 : 0);
 }
 
 void UHeadsetPresenceMonitor::EndPlay(const EEndPlayReason::Type EndPlayReason)
 {
+    // Unbind via stored handles so we don't leave dangling subscriptions
+    // on the global FCoreDelegates when this pawn tears down (e.g.,
+    // travel to a different level or PIE stop). Handle::Reset for
+    // self-zero is implicit on the Remove call.
+    if (DeactivateDelegateHandle.IsValid())
+    {
+        FCoreDelegates::ApplicationWillDeactivateDelegate.Remove(DeactivateDelegateHandle);
+        DeactivateDelegateHandle.Reset();
+    }
+    if (ReactivateDelegateHandle.IsValid())
+    {
+        FCoreDelegates::ApplicationHasReactivatedDelegate.Remove(ReactivateDelegateHandle);
+        ReactivateDelegateHandle.Reset();
+    }
+
     if (UWorld* World = GetWorld())
     {
         World->GetTimerManager().ClearTimer(PollTimer);
     }
     Super::EndPlay(EndPlayReason);
+}
+
+// --- Shared idle-edge helpers (single source of truth for bIsIdle) ---
+
+void UHeadsetPresenceMonitor::EnterIdle(const TCHAR* Reason)
+{
+    if (bIsIdle)
+    {
+        return;
+    }
+    bIsIdle = true;
+    UE_LOG(LogVRIPPresence, Log,
+        TEXT("EnterIdle (%s) — firing OnHeadsetIdleStarted"), Reason);
+    OnHeadsetIdleStarted.Broadcast();
+}
+
+void UHeadsetPresenceMonitor::ExitIdle(const TCHAR* Reason)
+{
+    if (!bIsIdle)
+    {
+        return;
+    }
+    bIsIdle = false;
+    NotWornAccumulator = 0.0f;
+    UE_LOG(LogVRIPPresence, Log,
+        TEXT("ExitIdle (%s) — firing OnHeadsetIdleEnded"), Reason);
+    OnHeadsetIdleEnded.Broadcast();
+}
+
+// --- Lifecycle delegate handlers (PRIMARY path) ----------------------
+
+void UHeadsetPresenceMonitor::HandleApplicationWillDeactivate()
+{
+    // CRITICAL: this is our one synchronous opportunity to do work
+    // before the OS suspends the game thread on Quest. Anything that
+    // would queue work onto a future tick (FTimerManager, async
+    // tasks, etc.) will NOT run. The BP-facing delegate broadcast
+    // chain is synchronous, so the BP graph's EmitHeadsetEnd /
+    // LeaveChannel / StopVideoPump nodes all execute before this
+    // function returns. That's exactly what we need.
+    EnterIdle(TEXT("ApplicationWillDeactivate"));
+}
+
+void UHeadsetPresenceMonitor::HandleApplicationHasReactivated()
+{
+    ExitIdle(TEXT("ApplicationHasReactivated"));
 }
 
 void UHeadsetPresenceMonitor::Poll()
@@ -64,12 +149,9 @@ void UHeadsetPresenceMonitor::Poll()
         : nullptr;
     if (!HMD)
     {
-        if (bIsIdle)
-        {
-            bIsIdle = false;
-            NotWornAccumulator = 0.0f;
-            OnHeadsetIdleEnded.Broadcast();
-        }
+        // No HMD device — desktop / headless / AR-only. Bail to "worn"
+        // semantics so the BP graph never sees a false idle.
+        ExitIdle(TEXT("Poll: no HMD device"));
         return;
     }
 
@@ -93,13 +175,7 @@ void UHeadsetPresenceMonitor::Poll()
     if (bWorn)
     {
         NotWornAccumulator = 0.0f;
-        if (bIsIdle)
-        {
-            bIsIdle = false;
-            UE_LOG(LogVRIPPresence, Log,
-                TEXT("Poll: Worn after idle — firing OnHeadsetIdleEnded"));
-            OnHeadsetIdleEnded.Broadcast();
-        }
+        ExitIdle(TEXT("Poll: Worn after idle"));
         return;
     }
 
@@ -108,12 +184,8 @@ void UHeadsetPresenceMonitor::Poll()
         TEXT("Poll: NotWorn accumulator=%.0fs / threshold=%.0fs (idle=%d)"),
         NotWornAccumulator, IdleThresholdSeconds, bIsIdle ? 1 : 0);
 
-    if (!bIsIdle && NotWornAccumulator >= IdleThresholdSeconds)
+    if (NotWornAccumulator >= IdleThresholdSeconds)
     {
-        bIsIdle = true;
-        UE_LOG(LogVRIPPresence, Log,
-            TEXT("Poll: NotWorn for %.0fs (>= %.0fs threshold) — firing OnHeadsetIdleStarted"),
-            NotWornAccumulator, IdleThresholdSeconds);
-        OnHeadsetIdleStarted.Broadcast();
+        EnterIdle(*FString::Printf(TEXT("Poll: NotWorn for %.0fs"), NotWornAccumulator));
     }
 }

@@ -1,10 +1,24 @@
 // UHeadsetPresenceMonitor — Phase 1 Agora cost-exposure mitigation.
-// See Devlog.md 2026-06-08 (audit) entry + 2026-06-11 entry for the full
-// rationale. TL;DR: Quest's proximity sleep stops the renderer but the
-// app + Agora SDK keep publishing — one forgotten overnight headset is
-// ≈ $0.72, a forgotten classroom over a weekend is ≈ $58. This component
-// is the per-headset half of the fix; the dashboard half is the
-// visibilitychange handler in Web_Dashboard/public/js/grid.js.
+// See Devlog.md 2026-06-08 (audit) entry + 2026-06-11 entries for the full
+// rationale. TL;DR: when a Quest is left on a desk Agora keeps billing
+// for channel membership even though no useful frames are being captured.
+// This component is the per-headset half of the fix; the dashboard half
+// is the visibilitychange handler in Web_Dashboard/public/js/grid.js.
+//
+// Two-path detection (per Devlog 2026-06-11 (fix) entry):
+//   1. PRIMARY — push-based via FCoreDelegates::ApplicationWillDeactivate /
+//      HasReactivated. Quest (and Pico, when their OS does the right thing)
+//      fire these on take-off / put-back-on BEFORE the OS suspends the
+//      game thread. This is the only path that actually works on Quest
+//      because Quest freezes the entire game thread shortly after take-off
+//      — FTimerManager stops ticking and any polling-based design dies
+//      with it.
+//   2. FALLBACK — pull-based GetHMDWornState() polling on FTimerManager.
+//      Useful for desktop dev (PIE / non-VR Editor) where the deactivate
+//      delegates don't fire, and as a defensive backstop on vendors whose
+//      OS doesn't fire the lifecycle delegates reliably. Same threshold
+//      semantics as before. Both paths share the bIsIdle flag so neither
+//      double-fires.
 //
 // Worn-state API note: in UE 5.5 GetHMDWornState() is declared on
 // IHeadMountedDisplay (the vendor-specific HMD interface), not on
@@ -123,7 +137,34 @@ protected:
     virtual void EndPlay(const EEndPlayReason::Type EndPlayReason) override;
 
 private:
+    /** FALLBACK path: pull-based worn-state sampling (see class comment). */
     void Poll();
+
+    /**
+     * PRIMARY path on Quest / Pico: push-based via UE's app-lifecycle
+     * delegates. ApplicationWillDeactivate fires on take-off (and any
+     * other focus-loss event — system overlays etc., which we also want
+     * to pause for). ApplicationHasReactivated fires on put-back-on /
+     * overlay close. Both fire synchronously on the game thread BEFORE
+     * the OS suspends the app, so we have a clean window to emit
+     * headset:end + Leave Channel before the freeze.
+     *
+     * Delegate handlers are not UFUNCTIONs because FCoreDelegates uses
+     * raw FSimpleMulticastDelegate, not the BP-facing dynamic variant.
+     * Stored handles below let EndPlay unbind cleanly so a torn-down
+     * pawn doesn't leave a stale dangling subscription on the global.
+     */
+    void HandleApplicationWillDeactivate();
+    void HandleApplicationHasReactivated();
+
+    FDelegateHandle DeactivateDelegateHandle;
+    FDelegateHandle ReactivateDelegateHandle;
+
+    /** Shared idle-edge helpers. Both Poll and the delegate handlers
+     *  route through these so the bIsIdle state machine has a single
+     *  enforcement point and event broadcasts never double-fire. */
+    void EnterIdle(const TCHAR* Reason);
+    void ExitIdle(const TCHAR* Reason);
 
     FTimerHandle PollTimer;
 
