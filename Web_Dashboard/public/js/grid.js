@@ -27,6 +27,14 @@ const state = {
   currentPage: 1,
   tileClients: new Map(),  // code -> { client, videoTrack, videoMount, durationTimer }
   focused: null,           // { code, client, videoTrack, audioTrack, micTrack? }
+  // Phase 1 Agora cost-exposure (Devlog 2026-06-11): when the browser tab
+  // is hidden (lock screen / other tab / minimised window), unsubscribe
+  // from every remote video & audio track and disable the focused-mode
+  // mic. Re-subscribe on visibility return. This cuts the "instructor
+  // tabs away and forgets" minute leak — see the audit entry in Devlog
+  // for the per-day cost numbers. Suspended state guards against double
+  // unsubscribe/resubscribe if visibilitychange fires twice in a row.
+  suspended: false,
 };
 
 // ---------- DOM refs --------------------------------------------------------
@@ -306,12 +314,8 @@ async function ensureTileClient(session) {
 
   client.on('user-published', async (user, mediaType) => {
     if (mediaType !== 'video') return;   // grid never plays audio
-    await client.subscribe(user, mediaType);
-    entry.videoTrack = user.videoTrack;
-    videoMount.innerHTML = '';
-    user.videoTrack.play(videoMount, { fit: 'cover' });
-    statusEl.className = 'tile__status status status--connected';
-    statusEl.textContent = 'Live';
+    if (state.suspended) return;         // tab is hidden — defer to resume
+    await subscribeAndPlayTileVideo(entry, user);
   });
   client.on('user-unpublished', (_user, mediaType) => {
     if (mediaType === 'video') {
@@ -324,6 +328,18 @@ async function ensureTileClient(session) {
   });
 
   await client.join(state.appId, tokenInfo.channel, tokenInfo.token, null);
+}
+
+// Phase 1 Agora cost-exposure: factored out of the user-published handler so
+// the visibilitychange resume path can reuse the same subscribe+render logic.
+// Always called from a context where state.suspended is already false.
+async function subscribeAndPlayTileVideo(entry, user) {
+  await entry.client.subscribe(user, 'video');
+  entry.videoTrack = user.videoTrack;
+  entry.videoMount.innerHTML = '';
+  user.videoTrack.play(entry.videoMount, { fit: 'cover' });
+  entry.statusEl.className = 'tile__status status status--connected';
+  entry.statusEl.textContent = 'Live';
 }
 
 function teardownTileClient(code, entry) {
@@ -385,17 +401,8 @@ async function enterFocusMode(code) {
   state.focused.client = client;
 
   client.on('user-published', async (user, mediaType) => {
-    await client.subscribe(user, mediaType);
-    if (mediaType === 'video') {
-      state.focused.videoTrack = user.videoTrack;
-      focusVideoMount.innerHTML = '';
-      user.videoTrack.play(focusVideoMount, { fit: 'contain' });
-    } else if (mediaType === 'audio') {
-      state.focused.audioTrack = user.audioTrack;
-      const initVol = Number(volumeSlider.value) || 100;
-      user.audioTrack.setVolume(initVol);
-      user.audioTrack.play();
-    }
+    if (state.suspended) return;    // tab hidden — defer to resume
+    await subscribeAndPlayFocusTrack(user, mediaType);
   });
   client.on('user-unpublished', (_user, mediaType) => {
     if (mediaType === 'video') {
@@ -583,6 +590,129 @@ function wireLogout() {
     }
   });
 }
+
+// ---------- focus subscribe helper (used by user-published + resume) --------
+// Always called from a context where state.suspended is already false.
+async function subscribeAndPlayFocusTrack(user, mediaType) {
+  if (!state.focused) return;
+  await state.focused.client.subscribe(user, mediaType);
+  if (mediaType === 'video') {
+    state.focused.videoTrack = user.videoTrack;
+    focusVideoMount.innerHTML = '';
+    user.videoTrack.play(focusVideoMount, { fit: 'contain' });
+  } else if (mediaType === 'audio') {
+    state.focused.audioTrack = user.audioTrack;
+    const initVol = Number(volumeSlider.value) || 100;
+    user.audioTrack.setVolume(initVol);
+    user.audioTrack.play();
+  }
+}
+
+// ---------- visibility-aware subscription suspend ---------------------------
+// Phase 1 Agora cost-exposure (Devlog 2026-06-11). When the tab is hidden
+// (other tab, locked screen, minimised window) we unsubscribe from every
+// remote track on every client and disable the focused-mode mic. Staying
+// joined to the channel — only the subscriptions go away — means resume
+// latency is ~500 ms (a `subscribe()` round-trip), not a full re-join +
+// token-mint. On resume we iterate each client's currently-published remote
+// users and re-subscribe to whatever's actually flowing.
+//
+// We do NOT pause publishing (the headset side keeps publishing into the
+// channel — that's the headset's HMD-worn-state monitor's job to handle).
+// We only stop SUBSCRIBING, which is what Agora bills the dashboard side
+// for in this role. Mic is disabled rather than unpublished because re-
+// enabling is instantaneous; re-publish would re-prompt for mic perms on
+// some browsers.
+async function suspendSubscriptions() {
+  if (state.suspended) return;
+  state.suspended = true;
+
+  for (const [, entry] of state.tileClients) {
+    try { entry.videoTrack?.stop(); } catch { /* ignore */ }
+    entry.videoTrack = null;
+    for (const user of entry.client.remoteUsers ?? []) {
+      if (user.videoTrack) {
+        try { await entry.client.unsubscribe(user, 'video'); } catch { /* ignore */ }
+      }
+    }
+    entry.videoMount.innerHTML =
+      '<div class="tile__placeholder">Paused (tab hidden)</div>';
+    entry.statusEl.className = 'tile__status status status--connecting';
+    entry.statusEl.textContent = 'Paused';
+  }
+
+  if (state.focused) {
+    const f = state.focused;
+    try { f.videoTrack?.stop(); } catch { /* ignore */ }
+    f.videoTrack = null;
+    try { f.audioTrack?.stop(); } catch { /* ignore */ }
+    f.audioTrack = null;
+    for (const user of f.client?.remoteUsers ?? []) {
+      if (user.videoTrack) {
+        try { await f.client.unsubscribe(user, 'video'); } catch { /* ignore */ }
+      }
+      if (user.audioTrack) {
+        try { await f.client.unsubscribe(user, 'audio'); } catch { /* ignore */ }
+      }
+    }
+    if (f.micTrack && f.micTrack.enabled) {
+      try { await f.micTrack.setEnabled(false); } catch { /* ignore */ }
+      setMicButtonState({ muted: true });
+    }
+    focusVideoMount.innerHTML =
+      '<div class="tile__placeholder">Paused (tab hidden)</div>';
+    focusStatus.className = 'status status--connecting';
+    focusStatus.textContent = 'Paused (tab hidden)';
+  }
+}
+
+async function resumeSubscriptions() {
+  if (!state.suspended) return;
+  state.suspended = false;
+
+  for (const [, entry] of state.tileClients) {
+    for (const user of entry.client.remoteUsers ?? []) {
+      if (user.hasVideo) {
+        try {
+          await subscribeAndPlayTileVideo(entry, user);
+        } catch (err) {
+          console.warn('[grid] tile resume failed', err);
+        }
+      }
+    }
+  }
+
+  if (state.focused) {
+    const f = state.focused;
+    for (const user of f.client?.remoteUsers ?? []) {
+      if (user.hasVideo) {
+        try { await subscribeAndPlayFocusTrack(user, 'video'); }
+        catch (err) { console.warn('[grid] focus video resume failed', err); }
+      }
+      if (user.hasAudio) {
+        try { await subscribeAndPlayFocusTrack(user, 'audio'); }
+        catch (err) { console.warn('[grid] focus audio resume failed', err); }
+      }
+    }
+    // Restore focus-status indicator. We can re-derive the channel from the
+    // focused state's code without another token round-trip.
+    focusStatus.className = 'status status--connected';
+    focusStatus.textContent = `Connected · session ${f.code}`;
+    // Note: we intentionally do NOT auto-unmute the mic — the instructor
+    // explicitly muted it (implicitly, by hiding the tab); they can
+    // re-enable it via the mic toggle when they're back.
+  }
+}
+
+document.addEventListener('visibilitychange', () => {
+  if (document.visibilityState === 'hidden') {
+    suspendSubscriptions().catch((err) =>
+      console.error('[grid] suspend failed', err));
+  } else if (document.visibilityState === 'visible') {
+    resumeSubscriptions().catch((err) =>
+      console.error('[grid] resume failed', err));
+  }
+});
 
 // ---------- cleanup ---------------------------------------------------------
 window.addEventListener('beforeunload', () => {

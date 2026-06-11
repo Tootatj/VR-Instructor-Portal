@@ -22,6 +22,14 @@ public class VR_Project : ModuleRules
 		// needed for the POST /api/token call that mints the Agora token after register.
 		PrivateDependencyModuleNames.AddRange(new string[] { "SocketIOClient", "SIOJson", "HTTP", "Json" });
 
+		// HeadMountedDisplay: UHeadsetPresenceMonitor (Phase 1 Agora cost mitigation,
+		// Devlog 2026-06-11) reads IXRTrackingSystem::GetHMDWornState() through GEngine
+		// to detect when a user has taken the headset off. Vendor plugin (OpenXR /
+		// PICOXR) selection is still controlled by [HMDPluginPriority] per the
+		// 2026-06-08 per-device cook recipe; this dependency is just the abstract
+		// interface.
+		PrivateDependencyModuleNames.Add("HeadMountedDisplay");
+
 		// Uncomment if you are using Slate UI
 		// PrivateDependencyModuleNames.AddRange(new string[] { "Slate", "SlateCore" });
 		

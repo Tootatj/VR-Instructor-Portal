@@ -1,12 +1,12 @@
 # How to Port the VR Instructor Portal into Another Unreal Project
 
-> **Last verified against:** UE 5.5.4 · PICOXR 3.4.1 · SocketIOClient v2.9.0 · Agora-Unreal-RTC-SDK v4.5.1 · `USignalingSubsystem` + `UTenantRegistry` git rev `<this commit>` (channel-swap fix)
+> **Last verified against:** UE 5.5.4 · PICOXR 3.4.1 · SocketIOClient v2.9.0 · Agora-Unreal-RTC-SDK v4.5.1 · `USignalingSubsystem` + `UTenantRegistry` + `UHeadsetPresenceMonitor` git rev `<this commit>` (Agora cost-exposure Phase 1)
 >
 > **Maintainer rule:** every time `SignalingSubsystem.h/.cpp`, `TenantRegistry.h/.cpp`,
-> the BP integration shape on `BP_VRPawn`, or the plugin set changes, update
-> the matching section below in the same commit. Add a row to the bottom of
-> the *Change log* at the end of this file with the date + commit hash +
-> one-line "what changed".
+> `HeadsetPresenceMonitor.h/.cpp`, the BP integration shape on `BP_VRPawn`,
+> or the plugin set changes, update the matching section below in the same
+> commit. Add a row to the bottom of the *Change log* at the end of this
+> file with the date + commit hash + one-line "what changed".
 
 This guide tells you how to take the signaling + pairing + command-relay
 layer from this project and reuse it in a **different Unreal Engine 5.5+
@@ -23,10 +23,11 @@ porting work below is entirely about the Unreal side.
 
 | Component | Portability |
 |---|---|
-| `SignalingSubsystem.h/.cpp` | **Drop-in.** Zero dependency on this project's pawn, scene, or Agora. Pure UE + Socket.IO + HTTP. |
+| `SignalingSubsystem.h/.cpp` | **Drop-in.** Zero dependency on this project's pawn, scene, or Agora. Pure UE + Socket.IO + HTTP. BP-callable surface (as of 2026-06-11): `RefreshToken`, `EmitHeadsetEnd`, `RequestSessionResume` — the latter two are the headset-idle-resume API used by `UHeadsetPresenceMonitor`. |
 | `TenantRegistry.h/.cpp` | **Drop-in.** Pure UE + HTTP + `FFileHelper`. Owns the first-launch company-code redemption + persistence. **Replaces any prior hardcoded `TenantId` in INI.** Has no UMG dependency — host apps can use their existing in-VR code-input panel (see *BYO code-input UI* section below). |
+| `HeadsetPresenceMonitor.h/.cpp` | **Drop-in.** `UActorComponent` that polls `IXRTrackingSystem::GetHMDWornState()` and fires `OnHeadsetIdleStarted` / `OnHeadsetIdleEnded` BP events for the Agora cost-exposure idle-detection path (Devlog 2026-06-11). Requires `HeadMountedDisplay` in the target module's `Build.cs`. No dependency on Agora or signaling — BP wires the events to whatever leave/rejoin path the host app exposes. |
 | `Web_Dashboard/` server | **Already portable.** Runs once, serves any UE app that speaks the wire protocol. |
-| BP integration on `BP_VRPawn` | **Pattern, not asset.** Reproduce the 5 graphs in the target project's pawn or game mode (first-boot init + signaling-ready gate + registration-gate spawn + `OnAgoraChannelChanged` swap handler + `OnJoinChannelSuccess` pump restart). Worked example included. |
+| BP integration on `BP_VRPawn` | **Pattern, not asset.** Reproduce the 5 graphs in the target project's pawn or game mode (first-boot init + signaling-ready gate + registration-gate spawn + `OnAgoraChannelChanged` swap handler + `OnJoinChannelSuccess` pump restart) plus the 2 `UHeadsetPresenceMonitor` event handlers if you're porting the idle-detection. Worked example included. |
 | Agora streaming pipeline (`AgoraVideoPump.h/.cpp` + Agora plugin) | **Optional / copyable.** Only needed if the target project has no streaming and you want this stack to provide it. |
 | PICOXR + universal-VR config | **Drop-in via** [`VR_Project/Plugins/README.md`](VR_Project/Plugins/README.md). Same plugin install recipe regardless of target — but cook with the per-device wrapper (`.\Tools\Cook-VRApp.ps1 -Device quest|pico`) rather than invoking UAT directly, because `[HMDPluginPriority]` must differ between vendors. See gotcha #11 (per-vendor IMC bindings) and gotcha #12 (per-device cook model + Quest baseline). |
 
@@ -66,22 +67,32 @@ Append to `<TargetProject>/Source/<TargetModule>/<TargetModule>.Build.cs`:
 
 ```csharp
 PrivateDependencyModuleNames.AddRange(new string[] { "SocketIOClient", "SIOJson", "HTTP", "Json" });
+// Only if copying HeadsetPresenceMonitor (the idle-detection component):
+PrivateDependencyModuleNames.Add("HeadMountedDisplay");
 ```
 
 ### A.2. Copy the C++ files
 
 ```powershell
-copy VR_Project\Source\VR_Project\SignalingSubsystem.h  <Target>\Source\<TargetModule>\
-copy VR_Project\Source\VR_Project\SignalingSubsystem.cpp <Target>\Source\<TargetModule>\
-copy VR_Project\Source\VR_Project\TenantRegistry.h      <Target>\Source\<TargetModule>\
-copy VR_Project\Source\VR_Project\TenantRegistry.cpp    <Target>\Source\<TargetModule>\
+copy VR_Project\Source\VR_Project\SignalingSubsystem.h        <Target>\Source\<TargetModule>\
+copy VR_Project\Source\VR_Project\SignalingSubsystem.cpp      <Target>\Source\<TargetModule>\
+copy VR_Project\Source\VR_Project\TenantRegistry.h            <Target>\Source\<TargetModule>\
+copy VR_Project\Source\VR_Project\TenantRegistry.cpp          <Target>\Source\<TargetModule>\
+copy VR_Project\Source\VR_Project\HeadsetPresenceMonitor.h    <Target>\Source\<TargetModule>\
+copy VR_Project\Source\VR_Project\HeadsetPresenceMonitor.cpp  <Target>\Source\<TargetModule>\
 ```
 
 The classes need **no edits** unless the target's module API macro differs:
-in `SignalingSubsystem.h` and `TenantRegistry.h`, change `VR_PROJECT_API`
-to `<TARGETMODULE>_API` (the macro UBT generates per module, all-caps +
-`_API`). The `#include "TenantRegistry.h"` in `SignalingSubsystem.cpp`
-should not need editing — both files end up in the same module.
+in `SignalingSubsystem.h`, `TenantRegistry.h`, and `HeadsetPresenceMonitor.h`,
+change `VR_PROJECT_API` to `<TARGETMODULE>_API` (the macro UBT generates
+per module, all-caps + `_API`). The `#include "TenantRegistry.h"` in
+`SignalingSubsystem.cpp` should not need editing — all three files end
+up in the same module.
+
+You can skip `HeadsetPresenceMonitor.h/.cpp` if the host app already
+has its own idle-detection or doesn't care about the Agora cost-exposure
+mitigation (e.g. a desktop-only consumer of the layer). The signaling +
+registry pair are independent of it.
 
 ### A.3. Add the INI config block
 
@@ -161,6 +172,39 @@ Four graph edits, all on the BP that owns the `Initialize` → `Make RtcEngineCo
 Reference implementation: `VR_Project/Content/VRTemplate/Blueprints/VRPawn.uasset`
 (open the asset; relevant graphs are `BeginPlay`, the `OnSignalingReady`
 custom event, and the `On Agora Channel Changed` handler).
+
+### A.4.2. Optional: idle-detection auto-leave (Agora cost mitigation)
+
+If you copied `HeadsetPresenceMonitor.h/.cpp` (recommended for any
+production deployment where Agora minutes are billed), add two more
+event bindings on the pawn:
+
+1. Add the `Headset Presence Monitor` component (drag-and-drop in the
+   Components panel). Defaults are correct for Quest-dominant deployments
+   (`PollIntervalSeconds=30`, `IdleThresholdSeconds=120`,
+   `bTreatUnknownAsWorn=true`). For Pico-dominant deployments only: flip
+   `bTreatUnknownAsWorn` to `false` and raise `IdleThresholdSeconds` to
+   ~300 s — PICOXR's worn-state through the generic OpenXR +
+   `IXRTrackingSystem` path returns `Unknown` more often than Quest, and
+   the conservative default would never trip idle on a Pico-only fleet.
+2. Bind `OnHeadsetIdleStarted` to a 3-node chain (run in this order):
+   `Signaling Subsystem → Emit Headset End` (server prunes the room),
+   then Agora `Leave Channel` (kills the publish bill — this is the
+   critical node), then `Agora Video Pump → Stop Video Pump` (drains
+   the readback).
+3. Bind `OnHeadsetIdleEnded` to a single
+   `Signaling Subsystem → Request Session Resume` node. That's it —
+   `RequestSessionResume` re-registers on the existing socket and
+   re-fetches a fresh Agora token, which because
+   `bHasFiredInitialCredentials` is already true fires
+   `OnAgoraChannelChanged`, which the A.4.1 handler above already
+   handles. **No new graph branches required for the rejoin cascade.**
+
+Full design rationale + cost impact numbers in Devlog 2026-06-11
+"Agora cost-exposure Phase 1 shipped". Component is a no-op outside VR
+contexts (non-VR PIE, dedicated server, headless CI) — `Poll` early-
+returns if `GEngine->XRSystem.IsValid()` is false, so you can leave it
+on a pawn that's also used in non-VR test maps without false-idling.
 
 ### A.4.1. The channel-swap handler (required even if you never use switch-org today)
 
@@ -318,6 +362,7 @@ since the target is not deploying to Meta hardware. Everything else
 | `Source/<Module>/<Module>.Build.cs` | Add `SocketIOClient`, `SIOJson`, `HTTP`, `Json` to `PrivateDependencyModuleNames`. |
 | `Source/<Module>/SignalingSubsystem.h/.cpp` | New files (copied from this project). Update `VR_PROJECT_API` → `<MODULE>_API` if needed. |
 | `Source/<Module>/TenantRegistry.h/.cpp` | New files (copied from this project). Update `VR_PROJECT_API` → `<MODULE>_API` if needed. |
+| `Source/<Module>/HeadsetPresenceMonitor.h/.cpp` | New files, **recommended for production** (Agora cost mitigation per A.4.2). Skip for desktop-only or non-billing-sensitive deployments. Update API macro if needed. |
 | `Source/<Module>/AgoraVideoPump.h/.cpp` | New files, **only if Recipe B**. |
 | `Config/DefaultGame.ini` | New `[/Script/<Module>.SignalingSubsystem]` and `[/Script/<Module>.TenantRegistry]` blocks. |
 | `Config/DefaultEngine.ini` | Update `[/Script/AndroidRuntimeSettings.AndroidRuntimeSettings]` + add `[/Script/PICOXRHMD.PICOXRSettings]` (if VR). |
@@ -449,7 +494,8 @@ Append a row when this guide's prescriptions change (new plugin, BP shape change
 
 | Date | Commit | What changed |
 |---|---|---|
-| 2026-06-08 | `<this commit>` | Per-device cook wrapper landed (`Tools/Cook-VRApp.ps1`) — replaces yesterday's manual-flip workaround for the universal-APK HMD-priority regression. Gotcha #12 fully rewritten to describe the script-based model + Quest baseline. TL;DR "PICOXR + universal-VR config" row updated to recommend the wrapper as the cook entry point. The script is portable to any project that ships PICOXR + Meta-OpenXR side-by-side. |
+| 2026-06-11 | `<this commit>` | Phase 1 Agora cost-exposure shipped (Devlog 2026-06-11). New `HeadsetPresenceMonitor.h/.cpp` added to TL;DR portability table + A.2 copy step + A.4.2 BP wiring sub-recipe + reference-table row. `Build.cs` snippet now mentions the `HeadMountedDisplay` dep needed for it. SignalingSubsystem TL;DR row updated to list the new BP-callable surface (`EmitHeadsetEnd` made public, new `RequestSessionResume`). The component is presented as "recommended for production, skippable for desktop-only" — host apps with their own idle-detection can leave it out. |
+| 2026-06-08 | `2a98aea` | Per-device cook wrapper landed (`Tools/Cook-VRApp.ps1`) — replaces yesterday's manual-flip workaround for the universal-APK HMD-priority regression. Gotcha #12 fully rewritten to describe the script-based model + Quest baseline. TL;DR "PICOXR + universal-VR config" row updated to recommend the wrapper as the cook entry point. The script is portable to any project that ships PICOXR + Meta-OpenXR side-by-side. |
 | 2026-06-08 | `1d2872f` | Phase 6 closeout (2-device test passes on real cross-vendor hardware). Added two new gotchas: #11 (`PICOTouch_*` EKeys are not bound by stock Quest-first IMCs — Pico controllers silently inert without an IMC audit) with the authoritative key-list extraction recipe, and #12 (the universal-APK promise from the 2026-06-03 Pico-A entry is broken on PICO OS 5+, documenting the manual workaround pending a proper fix). |
 | 2026-06-05 | `afe08c6` | Phase 6D channel-swap fix: new `USignalingSubsystem::OnAgoraChannelChanged(NewChannel)` delegate + `UAgoraVideoPump::RestartForNewChannel()` BP-callable. Recipe A.4 grew a 4th BP wiring step + new *A.4.1* subsection documenting the swap handler graph and the underlying Agora-channel-binding rationale. New gotcha #9 (`OnCredentialsReady` is first-boot only) and #10 (`GConfig` is load-once-at-editor-startup). TL;DR table updated from "4 graphs" to "5 graphs". |
 | 2026-06-04 | `26fefa1` | Phase 6D: added `UTenantRegistry` (first-launch code-redemption subsystem with persisted tenant binding); new INI block `[/Script/<Module>.TenantRegistry]`; new *BYO code-input UI* section for host apps that already have a registration panel; new gotcha #8 about `InitializeDependency` ordering between signaling and registry. |

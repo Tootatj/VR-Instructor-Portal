@@ -705,30 +705,77 @@ This category spans both sides of the deploy and is easy to miss.
 The clean-exit paths (headset `Deinitialize`, browser `beforeunload`,
 30-min token TTL safety net) are solid, but several "left on" /
 "backgrounded" / "no subscribers" cases burn billable Agora minutes
-invisibly. Full diagnosis + sized line items in the 2026-06-08
-"Agora cost-exposure mitigations" backlog entry in
-[`Devlog.md`](Devlog.md).
+invisibly. Full diagnosis + sized line items in the 2026-06-08 audit +
+2026-06-11 closeout entries in [`Devlog.md`](Devlog.md).
 
-**Minimum required before pointing real headsets at the production URL:**
-- Set an Agora console billing alert (`https://console.agora.io` →
-  Billing → set monthly threshold). 5 minutes; doesn't prevent anything,
-  but turns "discovered from invoice" into "alerted before damage compounds."
-- Coordinate with the VR developer to wire `IXRTrackingSystem::GetHMDWornState()`
-  detection on `BP_VRPawn` — after ~2 min of `NotWorn`, headset should
-  `LeaveChannel` + emit `headset:end`. ~3 hours of VR-side BP work.
-  Eliminates the dominant cost path (Quest's proximity sleep doesn't
-  stop the app, so we publish into a sleeping headset indefinitely
-  without this).
-- Add a `visibilitychange` handler in `grid.js` that unsubscribes
-  visible tiles when the tab is hidden, resubscribes on visible.
-  ~1 hour, web-side only. Catches the "instructor left a tab open over
-  the weekend" case.
+**Status as of 2026-06-11:** two of the three Phase 1 mitigations are
+shipped in code. Only the manual billing alert (step 1 below) and the
+~30 min of BP wiring on `BP_VRPawn` (step 2 below) remain.
 
-These three together are ~4-5 hours of work and bound the realistic
-"forgotten headset" / "forgotten tab" cost exposure to single-digit
-dollars/month even at fleet scale. Skipping them means a single
-overnight-forgotten classroom of 20 devices can burn ~$15-60 depending
-on duration before the token TTL safety net kicks in.
+#### Step 1. Set up an Agora console billing alert (5 min, do this first)
+
+Belt-and-braces backstop for the rare case where one of the code-side
+mitigations regresses or a brand-new cost path slips in. Costs nothing.
+
+1. Log into [`https://console.agora.io`](https://console.agora.io) with
+   the account that owns the production App ID.
+2. **Account → Billing → Notifications** (left nav).
+3. **Add a balance-alert** at the level you actually want to be paged at.
+   Pick a number you'd be uncomfortable seeing on the next invoice — for
+   the current 1-tenant pilot scale, `$50/month` is reasonable; bump up
+   per tenant once OneBonsai onboards customer #2 / #3 / etc.
+4. Add the on-call email(s) under **Notification recipients**. Production
+   ops + the project lead, at minimum.
+5. Optional: set a **prepaid balance auto-recharge cap** under
+   **Billing → Payment methods**. Cheap secondary fuse — Agora will fail
+   join attempts cleanly rather than overdrafting if the cap is reached.
+
+Verify by triggering a test alert (Agora's console has a "Send test
+notification" button under the same Notifications page) — confirm the
+on-call inbox actually receives it. A silent alert is no alert.
+
+#### Step 2. Coordinate the BP wiring on `BP_VRPawn` (~30 min, VR side)
+
+The C++ half shipped 2026-06-11 (`UHeadsetPresenceMonitor` + two new BP-
+callable methods on `USignalingSubsystem`: `EmitHeadsetEnd` and
+`RequestSessionResume`). The BP wiring step needs the VR developer
+because BP assets are binary `.uasset` files — they can't be patched
+from a web-side deploy PR.
+
+Send the VR dev this exact spec (verbatim from the `UHeadsetPresenceMonitor`
+header comment + the Devlog 2026-06-11 entry):
+
+> **On `BP_VRPawn` (`VR_Project/Content/VRTemplate/Blueprints/VRPawn.uasset`):**
+>
+> 1. Add the new `Headset Presence Monitor` component (drag-and-drop in the Components panel). Defaults are correct for production (`PollIntervalSeconds=30`, `IdleThresholdSeconds=120`, `bTreatUnknownAsWorn=true`). For Pico-dominant deployments only: flip `bTreatUnknownAsWorn` to `false` and raise `IdleThresholdSeconds` to ~300 s — PICOXR's worn-state reporting returns `Unknown` more often than Quest, and the conservative default would never trip idle on a Pico-only fleet.
+> 2. Bind `OnHeadsetIdleStarted` to a chain that runs (in order):
+>    - `Get Game Instance → Get Subsystem (USignalingSubsystem) → Emit Headset End` (server prunes the session room immediately)
+>    - Agora `Leave Channel` (kills the publish bill — this is the critical node)
+>    - `Get Agora Video Pump → Stop Video Pump` (drains the readback)
+> 3. Bind `OnHeadsetIdleEnded` to `Get Signaling Subsystem → Request Session Resume`. That's the only node needed — `RequestSessionResume` re-registers on the existing socket and re-fetches a fresh Agora token, which because `bHasFiredInitialCredentials` is already `true` fires the existing `OnAgoraChannelChanged` delegate. The Phase 6D channel-swap graph (already in `VRPawn.uasset`) handles the actual `JoinChannel + RestartForNewChannel` cascade — no new graph branches needed.
+>
+> **Verification (cross-vendor matrix, ~15 min once both devices are charged):**
+> - For each of Quest 3 + Pico 4 Enterprise: cook + sideload via `Tools/Cook-VRApp.ps1 -Device quest|pico`, register against a test tenant, leave the headset on the desk, watch `adb logcat -s LogVRIPPresence` for `OnHeadsetIdleStarted` to fire after `IdleThresholdSeconds` of `NotWorn`. Confirm the corresponding dashboard tile disappears (signal that `headset:end` arrived). Put the headset back on; watch `OnHeadsetIdleEnded` fire; confirm the tile reappears under the same code with the trainee POV streaming again.
+> - If `OnHeadsetIdleStarted` never fires on Pico: PICOXR's worn-state sensor is returning `Unknown` — flip `bTreatUnknownAsWorn=false` and raise the threshold per (1) above.
+
+#### What's already shipped (no action required for either side)
+
+| Mitigation | Shipped | Where |
+|---|---|---|
+| `UHeadsetPresenceMonitor` C++ component | 2026-06-11 | `VR_Project/Source/VR_Project/HeadsetPresenceMonitor.h/.cpp` |
+| `USignalingSubsystem::EmitHeadsetEnd` BP-callable | 2026-06-11 | Was already implemented; exposure made public + UFUNCTION |
+| `USignalingSubsystem::RequestSessionResume` BP-callable | 2026-06-11 | Re-emits register; fresh token fires existing `OnAgoraChannelChanged` |
+| Browser tab `visibilitychange` suspend/resume | 2026-06-11 | `Web_Dashboard/public/js/grid.js` |
+
+Cost impact after Steps 1 + 2 land: an overnight-forgotten classroom of
+20 devices burns ~$0.08 of Agora minutes (`2.5 min × 20 × $0.09/h`)
+instead of ~$15-60. An instructor with a weekend-forgotten tab burns
+effectively zero subscribed minutes (sub-second per visibility flip).
+
+Phases P2 (server-side max-session-duration safety net + per-tenant
+usage tracking endpoint) and P3 (no-subscribers headset idle) are still
+in the backlog at their original sizings — neither needs to land before
+first production rollout. P2 becomes interesting around customer #2.
 
 ---
 
@@ -875,5 +922,6 @@ Append a row when this guide's prescriptions change (new recipe, new gotcha lear
 
 | Date | Commit | What changed |
 |---|---|---|
-| 2026-06-08 | `<this commit>` | Added section D.9 (Agora cost-exposure mitigations) to the hardening checklist after the audit captured in Devlog 2026-06-08. Spans both sides of the deploy (headset HMD-worn-state idle detection + browser visibilitychange unsubscribe) so the web dev doing the deploy doesn't miss the VR-side coordination point. |
+| 2026-06-11 | `<this commit>` | Rewrote section D.9 from a placeholder ("coordinate with the VR dev to wire …") into a step-by-step actionable checklist. Two of the three Phase 1 Agora cost mitigations now ship in code (`UHeadsetPresenceMonitor` C++ component + `grid.js` visibilitychange handler + two new BP-callable methods on `USignalingSubsystem`), so D.9 collapses to: (1) one manual console click for the billing alert with the literal click-path, and (2) a verbatim BP-wiring spec for the VR dev (drag in `UHeadsetPresenceMonitor` + 2 event bindings) with cross-vendor verification steps. Section is now self-contained — no requirement to read the Devlog audit entry to act on it. |
+| 2026-06-08 | `76940b7` | Added section D.9 (Agora cost-exposure mitigations) to the hardening checklist after the audit captured in Devlog 2026-06-08. Spans both sides of the deploy (headset HMD-worn-state idle detection + browser visibilitychange unsubscribe) so the web dev doing the deploy doesn't miss the VR-side coordination point. |
 | 2026-06-08 | `41b3744` | Initial guide. Four recipes (A: PaaS / B: VPS / C: subpath-embedded / D: hardening checklist), integration-touchpoint section with the VR developer, 10 common gotchas pinned in advance, operational topics (tenant management / backups / updates / monitoring / cred rotation). Created because `HowToPort.md` explicitly disclaims web deploy and the Web_Dashboard/README.md only covers local dev — a web-developer handoff needed a parallel doc. |

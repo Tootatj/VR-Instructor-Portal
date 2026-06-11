@@ -648,6 +648,33 @@ void USignalingSubsystem::EmitHeadsetEnd()
     UE_LOG(LogVRIPSignaling, Log, TEXT("Emitted headset:end for code=%s"), *PairingCode);
 }
 
+// --- Phase 1 idle-resume: re-register + re-fetch token ----------------------
+
+void USignalingSubsystem::RequestSessionResume()
+{
+    // No socket at all means we never finished the initial OpenSocket (or
+    // the user unregistered mid-idle, which already torn down the socket).
+    // In either case there's nothing useful for us to do here — the next
+    // OnRegistrationChanged or socket reconnect will re-bootstrap.
+    if (!Socket)
+    {
+        UE_LOG(LogVRIPSignaling, Warning,
+            TEXT("RequestSessionResume: no socket — caller must wait for registration/reconnect"));
+        return;
+    }
+
+    UE_LOG(LogVRIPSignaling, Log,
+        TEXT("RequestSessionResume: re-registering code=%s tenant=%s"),
+        *PairingCode, *TenantId);
+
+    // EmitHeadsetRegister is idempotent via bRegisterInFlight; on ack the
+    // existing FetchToken cascade runs, and because bHasFiredInitialCredentials
+    // is true from the original boot the new credentials fire
+    // OnAgoraChannelChanged (NOT OnCredentialsReady), so the existing
+    // channel-swap BP graph picks it up with no new wiring.
+    EmitHeadsetRegister();
+}
+
 // --- State helper ------------------------------------------------------------
 
 void USignalingSubsystem::SetState(ESignalingState NewState)

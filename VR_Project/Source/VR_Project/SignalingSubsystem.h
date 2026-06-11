@@ -151,13 +151,39 @@ public:
     UFUNCTION(BlueprintCallable, Category = "Signaling")
     void RefreshToken();
 
+    // Phase 1 Agora cost-exposure (Devlog 2026-06-11). Tell the server to
+    // prune our session now (instead of waiting for the disconnect-driven
+    // cleanup). Fire-and-forget — safe to call when not connected or
+    // already-disconnected (no-op in both cases).
+    //
+    // Pairs with RequestSessionResume below for the "headset taken off
+    // -> server prunes -> headset put back on -> server re-creates"
+    // round-trip driven by UHeadsetPresenceMonitor. The socket stays
+    // open throughout (the underlying TCP/WebSocket connection is the
+    // cheap part); only the room state on the server is torn down.
+    UFUNCTION(BlueprintCallable, Category = "Signaling")
+    void EmitHeadsetEnd();
+
+    // Phase 1 Agora cost-exposure. Resume from an idle-detected pause:
+    // re-emits headset:register on the existing socket (the server
+    // re-creates the room) and re-fetches a fresh Agora token (the
+    // previous one was scoped to the now-pruned channel). The fresh
+    // /api/token response fires OnAgoraChannelChanged (because
+    // bHasFiredInitialCredentials is already true from the original
+    // boot), which the existing BP graph handles — no new BP wiring
+    // required for the re-join cascade itself.
+    //
+    // Safe to call multiple times; the bRegisterInFlight guard inside
+    // EmitHeadsetRegister coalesces concurrent calls.
+    UFUNCTION(BlueprintCallable, Category = "Signaling")
+    void RequestSessionResume();
+
 private:
     void LoadConfig();
     void GeneratePairingCode();
     void OpenSocket();
     void EmitHeadsetRegister();
     void FetchToken(bool bIsRefresh);
-    void EmitHeadsetEnd();
 
     void SetState(ESignalingState NewState);
 
