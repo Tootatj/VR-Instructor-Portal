@@ -1,12 +1,15 @@
 # How to Port the VR Instructor Portal into Another Unreal Project
 
-> **Last verified against:** UE 5.5.4 · PICOXR 3.4.1 · SocketIOClient v2.9.0 · Agora-Unreal-RTC-SDK v4.5.1 · `USignalingSubsystem` + `UTenantRegistry` + `UHeadsetPresenceMonitor` git rev `<this commit>` (Agora cost-exposure Phase 1)
+> **Last verified against:** UE 5.5.4 · PICOXR 3.4.1 · SocketIOClient v2.9.0 · Agora-Unreal-RTC-SDK v4.5.1 · `USignalingSubsystem` + `UTenantRegistry` + `UHeadsetPresenceMonitor` git rev `<this commit>` (per-app interactive control plane)
 >
 > **Maintainer rule:** every time `SignalingSubsystem.h/.cpp`, `TenantRegistry.h/.cpp`,
 > `HeadsetPresenceMonitor.h/.cpp`, the BP integration shape on `BP_VRPawn`,
-> or the plugin set changes, update the matching section below in the same
-> commit. Add a row to the bottom of the *Change log* at the end of this
-> file with the date + commit hash + one-line "what changed".
+> the plugin set, the wire protocol docs (`Web_Dashboard/docs/commands.md`,
+> `Web_Dashboard/docs/state-updates.md`), or the per-app module convention
+> (`Web_Dashboard/public/js/apps/README.md`) changes, update the matching
+> section below in the same commit. Add a row to the bottom of the
+> *Change log* at the end of this file with the date + commit hash +
+> one-line "what changed".
 
 This guide tells you how to take the signaling + pairing + command-relay
 layer from this project and reuse it in a **different Unreal Engine 5.5+
@@ -23,11 +26,12 @@ porting work below is entirely about the Unreal side.
 
 | Component | Portability |
 |---|---|
-| `SignalingSubsystem.h/.cpp` | **Drop-in.** Zero dependency on this project's pawn, scene, or Agora. Pure UE + Socket.IO + HTTP. BP-callable surface (as of 2026-06-11): `RefreshToken`, `EmitHeadsetEnd`, `RequestSessionResume` — the latter two are the headset-idle-resume API used by `UHeadsetPresenceMonitor`. |
+| `SignalingSubsystem.h/.cpp` | **Drop-in.** Zero dependency on this project's pawn, scene, or Agora. Pure UE + Socket.IO + HTTP. BP-callable surface (as of 2026-06-15): `RefreshToken`, `EmitHeadsetEnd`, `RequestSessionResume`, `EmitStateUpdate(StateName, Data)`, `EmitStateUpdateFromJson(StateName, DataJsonString)`. BP-readable: `AppId`, `AppVersion` (declared in `DefaultGame.ini`, see A.3). `OnHeadsetCommand` delegate now surfaces a full `PayloadJson` string alongside the legacy typed fields, so per-app commands parse in BP via the SocketIO plugin's `Construct Json Object` + `Decode Json` node pair (both under category `SIOJ \| Json`). Wire-protocol contract for both directions: `Web_Dashboard/docs/commands.md` (web → headset) and `Web_Dashboard/docs/state-updates.md` (headset → web). |
 | `TenantRegistry.h/.cpp` | **Drop-in.** Pure UE + HTTP + `FFileHelper`. Owns the first-launch company-code redemption + persistence. **Replaces any prior hardcoded `TenantId` in INI.** Has no UMG dependency — host apps can use their existing in-VR code-input panel (see *BYO code-input UI* section below). |
 | `HeadsetPresenceMonitor.h/.cpp` | **Drop-in.** `UActorComponent` that polls `IXRTrackingSystem::GetHMDWornState()` and fires `OnHeadsetIdleStarted` / `OnHeadsetIdleEnded` BP events for the Agora cost-exposure idle-detection path (Devlog 2026-06-11). Requires `HeadMountedDisplay` in the target module's `Build.cs`. No dependency on Agora or signaling — BP wires the events to whatever leave/rejoin path the host app exposes. |
 | `Web_Dashboard/` server | **Already portable.** Runs once, serves any UE app that speaks the wire protocol. |
-| BP integration on `BP_VRPawn` | **Pattern, not asset.** Reproduce the 5 graphs in the target project's pawn or game mode (first-boot init + signaling-ready gate + registration-gate spawn + `OnAgoraChannelChanged` swap handler + `OnJoinChannelSuccess` pump restart) plus the 2 `UHeadsetPresenceMonitor` event handlers if you're porting the idle-detection. Worked example included. |
+| BP integration on `BP_VRPawn` | **Pattern, not asset.** Reproduce the 5 graphs in the target project's pawn or game mode (first-boot init + signaling-ready gate + registration-gate spawn + `OnAgoraChannelChanged` swap handler + `OnJoinChannelSuccess` pump restart) plus the 2 `UHeadsetPresenceMonitor` event handlers if you're porting the idle-detection, plus the per-app state-publish + command-handle graphs from A.4.3 if you're wiring the per-app dashboard UI. Worked example included. |
+| Per-app dashboard UI (`Web_Dashboard/public/js/apps/<AppId>.js`) | **One JS file per VR app.** Optional. Each VR app that wants a custom instructor panel (level picker, per-level controls, in-level metric display) ships an ES module in this directory matching its declared `AppId`. The dashboard's focus view dynamic-imports it based on the live session's `appId`. Sessions without an `appId` (or with no matching module) get the generic fallback panel and still work via the always-present app-agnostic command deck. Module shape + conventions: `Web_Dashboard/public/js/apps/README.md`. |
 | Agora streaming pipeline (`AgoraVideoPump.h/.cpp` + Agora plugin) | **Optional / copyable.** Only needed if the target project has no streaming and you want this stack to provide it. |
 | PICOXR + universal-VR config | **Drop-in via** [`VR_Project/Plugins/README.md`](VR_Project/Plugins/README.md). Same plugin install recipe regardless of target — but cook with the per-device wrapper (`.\Tools\Cook-VRApp.ps1 -Device quest|pico`) rather than invoking UAT directly, because `[HMDPluginPriority]` must differ between vendors. See gotcha #11 (per-vendor IMC bindings) and gotcha #12 (per-device cook model + Quest baseline). |
 
@@ -107,6 +111,14 @@ ServerUrl="http://<dashboard-host>:3000"
 TenantId=<dev-fallback-tenant-slug>   ; ONLY used when bAllowUnregisteredBoot=true below
 Scenario=<default scenario name displayed on dashboard grid tile>
 TraineeName=<default trainee name>
+; Per-app interactive control plane (2026-06-15). Both optional, both
+; should be set for any target project that wants per-app instructor UI.
+; AppId is the dashboard's lookup key for the per-app module
+; (Web_Dashboard/public/js/apps/<AppId>.js). Use the target project's
+; identifier in PascalCase (e.g. "VRForklift", "VRChemSafety"). Leaving
+; both blank yields a generic video-only dashboard panel.
+AppId=<TargetAppId>
+AppVersion=1.0.0
 
 [/Script/<TargetModule>.TenantRegistry]
 ; ServerUrl falls back to the SignalingSubsystem URL above if omitted.
@@ -205,6 +217,79 @@ Full design rationale + cost impact numbers in Devlog 2026-06-11
 contexts (non-VR PIE, dedicated server, headless CI) — `Poll` early-
 returns if `GEngine->XRSystem.IsValid()` is false, so you can leave it
 on a pawn that's also used in non-VR test maps without false-idling.
+
+### A.4.3. Optional: per-app interactive control plane (instructor dashboard UI)
+
+If the target project wants instructor-side UI beyond the four legacy
+app-agnostic commands (`pause_simulation`, `change_environment`,
+`trigger_event`, `reset_user_position`) — for example: a level picker, a
+scenario state display, custom in-level controls — wire the per-app
+control plane. This is what enables the dashboard's focus view to switch
+from a generic command deck to a fully-bespoke UI per VR app.
+
+**One-time setup, shared by every per-app integration:**
+
+1. Set `AppId=<YourAppId>` in `DefaultGame.ini`'s `[/Script/<TargetModule>.SignalingSubsystem]`
+   section (added in A.3 above). The headset declares this in
+   `headset:register` so the dashboard knows which UI module to load.
+2. Ship a dashboard module at `Web_Dashboard/public/js/apps/<YourAppId>.js`.
+   Convention + shape: `Web_Dashboard/public/js/apps/README.md`. Use
+   `VRFT.js` in the same directory as the reference implementation.
+3. Register the app's command vocabulary in
+   `Web_Dashboard/src/commands.js`'s `APP_COMMAND_VALIDATORS[<YourAppId>]`
+   block. Server rejects unknown commands per `.cursorrules §5.2`.
+4. Document the app's state machine + command list in
+   `Web_Dashboard/docs/state-updates.md` and `Web_Dashboard/docs/commands.md`
+   under matching `### appId: "<YourAppId>"` subsections.
+
+**Per state transition the VR app makes**, BP wires — pick whichever
+`EmitStateUpdate` variant is simpler for your data shape:
+
+1. **For complex data shapes (arrays of objects, nested structures):**
+   build a JSON string (`Format Text` from a Data Table, or
+   `Make Literal String` for a fixed catalog) and call
+   `Get Signaling Subsystem → Emit State Update (From JSON String)`
+   with the state name + the string. Parse failures log a warning
+   server-side but still deliver the state transition (with empty
+   data) — preferable to a dropped transition.
+2. **For simple data shapes (1-3 scalar fields):** build a
+   `USIOJsonObject` via the SocketIO plugin's `Construct Json Object`
+   node + `Set String Field` / `Set Number Field` setters (all under
+   category `SIOJ \| Json`), then call `Get Signaling Subsystem →
+   Emit State Update` with the state name + object reference. Pass
+   `None` for stateless transitions.
+
+Server caps serialised data at 8 KB and rate-limits at 30 updates per
+3-second window per code. Both BP variants are fire-and-forget — no ack
+handling needed.
+
+**Per command the dashboard sends**, BP wires:
+
+1. **Bind `OnHeadsetCommand` on the signaling subsystem.** Switch on
+   `Command.Command` (the string). For the four legacy app-agnostic
+   commands the typed fields (`BoolValue`, `StringValue`) stay populated
+   for back-compat. For app-specific commands, parse `Command.PayloadJson`.
+2. **Parse `PayloadJson` via the SocketIO plugin's two-step pattern:**
+   `Construct Json Object` (returns an empty USIOJsonObject*) → drag off
+   that object → `Decode Json` (input the `PayloadJson` string, returns
+   bool on parse success). Both nodes live under category `SIOJ \| Json`.
+   Then read fields off the now-populated object with `Get String Field` /
+   `Get Number Field` / `Try Get String Field` (safer variant that
+   returns bool + out-string when a field might be absent).
+3. **Publish the resulting state transition** via `EmitStateUpdate` so
+   the dashboard's UI reflects what the command achieved (or didn't).
+
+Worked example: `Web_Dashboard/public/js/apps/VRFT.js` is the dashboard
+side; the VR side wiring lives in `BP_VRPawn`'s `BeginPlay` (initial
+state publish) + the new `On Headset Command` handler graph (covered in
+the dashboard's PROTOCOL docs). The headset is the source of truth for
+"what content exists" — the dashboard renders whatever the headset
+publishes, never assumes a hardcoded catalog.
+
+This component is opt-in: a target project that leaves `AppId` blank
+still streams video to the grid view, still accepts the four legacy
+commands, just doesn't get app-specific instructor UI. The four legacy
+commands stay app-agnostic and always work.
 
 ### A.4.1. The channel-swap handler (required even if you never use switch-org today)
 
@@ -451,6 +536,8 @@ have to dig:
 11. **PICOXR controllers fire `PICOTouch_*` EKeys — not `OculusTouch_*` or generic `MotionController_*`.** UE's stock Input Mapping Contexts shipped with the VR Template (and anything copy-pasted from a Quest-first project) bind only OpenXR / Meta key codes. With no `PICOTouch_*` rows, Pico controllers track and render correctly but every *button* is silently inert — trigger doesn't click, grip doesn't grab, thumbstick is dead. The fix is to add additional rows to every relevant `IA_*` in your project IMCs, alongside the existing OpenXR bindings: same `IA`, additional `Key` column = `PICOTouch_<Hand>_<Button>_<Action>`. Both vendors then fire the same actions; existing BP event graphs need no changes (Quest never fires `PICOTouch_*` so the extra rows are harmless on Quest). Authoritative key list (36 keys: trigger/grip/A/B/X/Y/thumbstick/thumbrest/home/menu/volume/system × left/right × click/touch/axis) lives in the strings table of the editor-side PICOXR input binary at `<your-target>/Plugins/PICOXR/Binaries/Win64/UnrealEditor-PICOXRInput.dll`. Extract with a PowerShell one-liner if UE's key-picker dropdown isn't enough: `[regex]::Matches([System.Text.Encoding]::ASCII.GetString([System.IO.File]::ReadAllBytes("<path>")), 'PICOTouch_[A-Za-z0-9_]+') | Sort-Object {$_.Value} -Unique`. Discovery + minimum mapping table for menu-interact + locomotion in Devlog 2026-06-08 "Pico controller input gap". *In **this** project, `IMC_Menu` and `IMC_Default` are now Pico-aware as of that entry; `IMC_Hands` / `IMC_Weapon_Right` / `IMC_Weapon_Left` are still OpenXR-only and need the same audit before any feature that depends on them ships cross-vendor.*
 12. **Quest and Pico need different `[HMDPluginPriority]` blocks — neither value works universally on PICO OS 5+.** The original Phase 6D claim ("`OpenXR=10, PICOXRHMD=0` is universal because OpenXR self-fails on Pico") doesn't hold: Pico ships a generic OpenXR runtime layer alongside the proprietary PICO runtime, so UE's OpenXR plugin's `IsHMDConnected()` returns true on Pico too. `OpenXR=10` makes OpenXR win HMD selection on Pico, half-initialize against the wrong runtime, never produce a VR frame, and trigger an ANR after ~8s (`pre_display_error: has lasted for 7.5s` + `clientPid=<vrshell-pid>` — full diagnosis in Devlog 2026-06-08). The inverse — `OpenXR=0, PICOXRHMD=10` — works on Pico but hits the original `CalculateRenderTargetSize` assertion on Quest. **Resolution: a per-device cook wrapper script.** This project ships `Tools/Cook-VRApp.ps1` (PowerShell), which mutates `[HMDPluginPriority]` for the duration of one UAT invocation and restores it via a guaranteed `try/finally`. Use as the canonical cook entry point: `.\Tools\Cook-VRApp.ps1 -Device quest|pico|auto` (auto detects from `adb devices` + `getprop ro.product.manufacturer`). The script also renames the produced APK to `VR_Project-Quest-arm64.apk` / `VR_Project-Pico-arm64.apk` so both vendors' APKs co-exist on disk. **The baseline in `DefaultEngine.ini` is Quest** (`OpenXR=10, PICOXRHMD=0`) — matches what the in-editor VR Preview / PIE wants for Quest+Link dev workflow. **When porting into a target project**, copy `Tools/Cook-VRApp.ps1` alongside the C++ files and adjust its `$priorityValues` hashtable + `$repoRoot/$uprojPath` constants. The same per-device cook model applies to any project that ships both PICOXR and Meta-OpenXR plugins from one source tree.
 
+13. **SocketIO `BindEventToFunction` inspects ONLY the first UFUNCTION parameter to decide how to pack `ProcessEvent` args.** Plugin source: `USocketIOClientComponent::CallBPFunctionWithResponse` (`Plugins/SocketIOClient/Source/SocketIOClient/Private/SocketIOClientComponent.cpp` ~line 284) switches on `Properties[0]->GetCPPType()` — if it's `USIOJsonValue*` it packs a wrapped JSON value into Arg01; if it's `FString` it packs a stringified JSON into the single arg; etc. **There is no fallback for "first param is FString, second param is USIOJsonValue*"** — the plugin packs an FString and calls. The second param gets whatever uninitialised stack memory was at that offset. Symptom is an access-violation crash deep inside `USIOJsonValue::AsObject()` reading `0xffffffff` (or another garbage address) on the FIRST inbound event the binding ever receives. Diagnosed 2026-06-15 on the first end-to-end command test (the binding had been in the codebase since Phase 4A but never actually invoked because no command had ever been sent through the dashboard before per-app UI shipped). **Fix: any UFUNCTION bound via `BindEventToFunction` MUST have `USIOJsonValue*` (or one of the other supported single types — see the if/else chain in `CallBPFunctionWithResponse`) as its sole or first parameter.** A leading `FString EventName` parameter — natural for handlers that listen to multiple events — will silently miscall. We dropped `EventName` from `HandleHeadsetCommandEvent` since we know the event name from the binding; a multi-event handler should use a separate UFUNCTION per event instead. There's a CRITICAL comment on both the .h declaration and .cpp body of `HandleHeadsetCommandEvent` warning against re-introducing the bug — preserve it when porting.
+
 ---
 
 ## Future: extract to a real Unreal plugin
@@ -494,6 +581,8 @@ Append a row when this guide's prescriptions change (new plugin, BP shape change
 
 | Date | Commit | What changed |
 |---|---|---|
+| 2026-06-15 (follow-up) | `<this commit>` | End-to-end PIE verification of per-app control plane caught two issues, both now fixed and documented. (1) **Gotcha #13 added** — the SocketIOClient plugin's `BindEventToFunction` inspects only the first UFUNCTION parameter to decide arg-packing; a leading `FString EventName` param with a trailing `USIOJsonValue*` silently miscalls and crashes in `AsObject()` on first inbound event. Fix: drop the `FString` and bind one UFUNCTION per event. CRITICAL warning comments now live on the .h declaration + .cpp body of `HandleHeadsetCommandEvent`. (2) **New BP overload `EmitStateUpdateFromJson(StateName, DataJsonString)`** — the original `USIOJsonObject*` variant is verbose for array-of-objects payloads (e.g. `available_levels`); the JSON-string variant lets BPs ship the entire payload as a single literal or `Format Text` result. A.4.3 now documents both with "pick whichever is simpler for your data shape" guidance. TL;DR row for `SignalingSubsystem.h/.cpp` lists both variants. Also corrected an incorrect node name reference: parsing `Command.PayloadJson` uses `Construct Json Object` + `Decode Json` (two nodes, both under `SIOJ \| Json`), NOT the fictional "Construct Json Object From String" node. |
+| 2026-06-15 | `<this commit>` | Per-app interactive control plane landed. `USignalingSubsystem` BP surface grew `EmitStateUpdate(StateName, Data)` (BP-callable), `AppId` + `AppVersion` (BP-readable, loaded from `DefaultGame.ini`), and `FSignalingCommand::PayloadJson` (full JSON of any inbound command, so per-app commands parse cleanly in BP without new C++ struct fields per command shape). New TL;DR row for the per-app dashboard module convention (`Web_Dashboard/public/js/apps/<AppId>.js`). New sub-recipe **A.4.3** documents the wiring for any target project that wants instructor-side UI beyond the four app-agnostic commands. New cross-reference to the wire-protocol docs (`Web_Dashboard/docs/commands.md` for web → headset, `Web_Dashboard/docs/state-updates.md` for headset → web). INI snippet in A.3 now includes `AppId` + `AppVersion`. The full control plane is **opt-in**: target projects that leave `AppId` blank still stream video + accept legacy commands, they just don't get app-specific dashboard UI. |
 | 2026-06-11 | `<this commit>` | Phase 1 Agora cost-exposure shipped (Devlog 2026-06-11). New `HeadsetPresenceMonitor.h/.cpp` added to TL;DR portability table + A.2 copy step + A.4.2 BP wiring sub-recipe + reference-table row. `Build.cs` snippet now mentions the `HeadMountedDisplay` dep needed for it. SignalingSubsystem TL;DR row updated to list the new BP-callable surface (`EmitHeadsetEnd` made public, new `RequestSessionResume`). The component is presented as "recommended for production, skippable for desktop-only" — host apps with their own idle-detection can leave it out. |
 | 2026-06-08 | `2a98aea` | Per-device cook wrapper landed (`Tools/Cook-VRApp.ps1`) — replaces yesterday's manual-flip workaround for the universal-APK HMD-priority regression. Gotcha #12 fully rewritten to describe the script-based model + Quest baseline. TL;DR "PICOXR + universal-VR config" row updated to recommend the wrapper as the cook entry point. The script is portable to any project that ships PICOXR + Meta-OpenXR side-by-side. |
 | 2026-06-08 | `1d2872f` | Phase 6 closeout (2-device test passes on real cross-vendor hardware). Added two new gotchas: #11 (`PICOTouch_*` EKeys are not bound by stock Quest-first IMCs — Pico controllers silently inert without an IMC audit) with the authoritative key-list extraction recipe, and #12 (the universal-APK promise from the 2026-06-03 Pico-A entry is broken on PICO OS 5+, documenting the manual workaround pending a proper fix). |

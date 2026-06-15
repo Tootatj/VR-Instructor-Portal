@@ -101,8 +101,21 @@
           </p>
         </div>
 
+        <!-- Per-app UI panel (2026-06-15). When the focused session's
+             appId resolves to a per-app module (e.g. apps/VRFT.js), the
+             loader populates this container with the app's state-driven
+             controls (level picker, scenario status, etc). When no
+             module matches (or the headset omitted appId), the fallback
+             module renders a small "no app UI" notice here. Always
+             rendered above the generic command deck below — per-app
+             controls are the primary surface; generic commands are
+             secondary fallbacks that work across any VR app. -->
+        <section id="focus-app-panel" class="focus-app-panel" aria-label="Per-app controls">
+          <!-- populated by js/apps/_loader.js on focus mode entry -->
+        </section>
+
         <div class="command-deck">
-          <h3 class="command-deck__title">Commands</h3>
+          <h3 class="command-deck__title">Generic controls</h3>
 
           <button type="button" class="command-btn" data-command="pause_simulation" data-value="true">
             <span class="command-btn__label">Pause simulation</span>

@@ -2,23 +2,38 @@
 //
 // UGameInstanceSubsystem that owns the headset's relationship with the
 // Web_Dashboard signaling server. Speaks the wire protocol documented in
-// `.cursorrules §5.1` and `Web_Dashboard/README.md`:
+// `.cursorrules §5.1`, `Web_Dashboard/README.md`,
+// `Web_Dashboard/docs/commands.md`, and `Web_Dashboard/docs/state-updates.md`:
 //
 //   1. Socket.IO connect to ws://<ServerUrl>/socket.io
 //   2. emit `headset:register` { code, tenantId, scenario, traineeName,
-//      source:"headset" } with ack callback → expects { ok:true, tenantId }
+//      source:"headset", appId?, appVersion? } with ack callback
+//      → expects { ok:true, tenantId }. Optional appId enables the
+//      per-app interactive control plane (2026-06-15).
 //   3. POST /api/token { code, role:"publisher", uid:0 }
 //      → 200 { appId, token, channel, uid, expiresAt }
 //   4. Fires OnCredentialsReady so BP_VRPawn can JoinChannel with the
 //      server-minted values.
 //   5. Listens for `headset:command` and re-broadcasts as OnHeadsetCommand.
-//   6. Refreshes the token at expiresAt - 300s (safety net well inside
+//      Commands carry both the legacy typed fields AND a full PayloadJson
+//      string so per-app commands (e.g. VRFT's load_level) parse cleanly.
+//   6. Emits `headset:state-update` { code, state, data?, seq? } from BP
+//      via EmitStateUpdate — the headset side of the per-app control plane.
+//      Server fans these out to the dashboard's per-app UI module.
+//   7. Refreshes the token at expiresAt - 300s (safety net well inside
 //      Agora's own OnTokenPrivilegeWillExpire window).
-//   7. On Deinitialize, emits `headset:end` so the server can prune the room
+//   8. On Deinitialize, emits `headset:end` so the server can prune the room
 //      immediately rather than waiting for the disconnect-driven cleanup.
 //
 // Pairing code strategy: random per cold launch, retained across hot
 // reconnects within the same boot. New cold launch → new code.
+//
+// App identity strategy: AppId + AppVersion read from
+// Config/DefaultGame.ini's [/Script/VR_Project.SignalingSubsystem] section.
+// Each target VR project sets its own values when porting (e.g. "VRFT" /
+// "1.0.0" for VR Fire Training). An empty AppId is valid — the server
+// treats the session as app-less and the dashboard falls back to a
+// generic video-only panel.
 
 #pragma once
 
@@ -51,9 +66,13 @@ struct FSignalingCommand
 {
     GENERATED_BODY()
 
-    // One of: "pause_simulation", "change_environment", "trigger_event",
-    // "reset_user_position". BP should switch on this and ignore unknowns
-    // per .cursorrules §5.2.
+    // Command identifier. The four canonical app-agnostic commands per
+    // docs/commands.md are: "pause_simulation", "change_environment",
+    // "trigger_event", "reset_user_position". App-specific commands
+    // (e.g. VRFT's "load_level", "return_to_hub") flow through the same
+    // struct with their payload in PayloadJson — BP parses it via the
+    // SocketIO plugin's JSON nodes. BP should switch on Command and
+    // ignore unknowns per .cursorrules §5.2.
     UPROPERTY(BlueprintReadOnly, Category = "Signaling")
     FString Command;
 
@@ -65,6 +84,18 @@ struct FSignalingCommand
     // those two commands.
     UPROPERTY(BlueprintReadOnly, Category = "Signaling")
     FString StringValue;
+
+    // 2026-06-15 — per-app interactive control plane. The full JSON of the
+    // command (including the "command" field itself), so BP can parse
+    // app-specific fields without needing a new typed field per new
+    // command shape. For the four legacy app-agnostic commands above the
+    // typed fields stay populated for back-compat; new app-specific
+    // commands (e.g. VRFT's "load_level": { level_id: "kitchen_fire" })
+    // only populate PayloadJson and the BP author parses it with the
+    // SocketIO plugin's two-step "Construct Json Object" → "Decode Json"
+    // pattern (both under category SIOJ | Json).
+    UPROPERTY(BlueprintReadOnly, Category = "Signaling")
+    FString PayloadJson;
 };
 
 DECLARE_DYNAMIC_MULTICAST_DELEGATE(FOnCredentialsReady);
@@ -125,6 +156,22 @@ public:
     UPROPERTY(BlueprintReadOnly, Category = "Signaling")
     ESignalingState State = ESignalingState::Disconnected;
 
+    // 2026-06-15 — per-app interactive control plane. Identifier the headset
+    // declares in `headset:register` so the dashboard's focus view knows
+    // which per-app UI module to load (e.g. "VRFT" → apps/VRFT.js).
+    // Loaded from Config/DefaultGame.ini section
+    // [/Script/VR_Project.SignalingSubsystem] key `AppId`. Empty means
+    // "no app declared" — server treats the session as app-less and the
+    // dashboard renders a generic video-only panel.
+    UPROPERTY(BlueprintReadOnly, Category = "Signaling")
+    FString AppId;
+
+    // Free-form version label. Useful when one VR app evolves its state
+    // machine + commands across releases. Loaded from the same INI key
+    // `AppVersion`. Empty when unset.
+    UPROPERTY(BlueprintReadOnly, Category = "Signaling")
+    FString AppVersion;
+
     // --- BP-assignable delegates ---
 
     UPROPERTY(BlueprintAssignable, Category = "Signaling")
@@ -178,7 +225,49 @@ public:
     UFUNCTION(BlueprintCallable, Category = "Signaling")
     void RequestSessionResume();
 
+    // 2026-06-15 — per-app interactive control plane. Publish a state
+    // transition to the dashboard. The server fans it out to every
+    // instructor currently subscribed to this headset's tenant, plus the
+    // legacy 1:1 instructor pinned to this code (if any).
+    //
+    // StateName: lowercase snake_case label (≤64 chars, matches
+    //   /^[a-z][a-z0-9_]{0,63}$/). Free-form per app; the per-app
+    //   dashboard module knows which state names to expect.
+    //
+    // Data: optional USIOJsonObject (construct via SocketIO plugin's
+    //   "Construct Json Object" BP node + setters, or pass nullptr/None
+    //   for stateless transitions). Server caps the serialised payload
+    //   at 8 KB; oversize payloads are dropped server-side with a
+    //   diagnostic log.
+    //
+    // Fire-and-forget — no ack-handling needed in BP. Server-side rate
+    // limit is 30 updates per 3-second sliding window per code, so the
+    // BP author should emit once per real state transition, not once
+    // per tick.
+    UFUNCTION(BlueprintCallable, Category = "Signaling", meta = (DisplayName = "Emit State Update"))
+    void EmitStateUpdate(const FString& StateName, USIOJsonObject* Data);
+
+    // Convenience overload that takes the data as a JSON string instead
+    // of a USIOJsonObject. Useful when the data shape is complex (e.g.
+    // VRFT's hub state with its available_levels array) — building 10+
+    // nested Construct Json Object nodes in BP gets unwieldy fast;
+    // `Format Text` or string concat from a Data Table is often cleaner.
+    //
+    // DataJsonString must parse as a JSON OBJECT (top-level `{...}`).
+    // Parse failures log a warning and emit with no data rather than
+    // dropping the transition entirely — losing the transition is
+    // strictly worse than losing the payload fields.
+    //
+    // Pass an empty string for stateless transitions (equivalent to
+    // calling EmitStateUpdate with Data=None).
+    UFUNCTION(BlueprintCallable, Category = "Signaling", meta = (DisplayName = "Emit State Update (From JSON String)"))
+    void EmitStateUpdateFromJson(const FString& StateName, const FString& DataJsonString);
+
 private:
+    // Shared backend for both BP-callable EmitStateUpdate overloads.
+    // Data may be null for stateless transitions.
+    void EmitStateUpdateInternal(const FString& StateName, TSharedPtr<FJsonObject> Data);
+
     void LoadConfig();
     void GeneratePairingCode();
     void OpenSocket();
@@ -207,8 +296,19 @@ private:
     void HandleConnectionProblems(int32 Attempts, int32 NextAttemptInMs, float TimeSinceConnected);
 
     // Bound to the `headset:command` event via BindEventToFunction.
+    //
+    // CRITICAL: the SocketIO plugin's BindEventToFunction inspects ONLY the
+    // FIRST UFUNCTION parameter to decide how to pack the call args (see
+    // USocketIOClientComponent::CallBPFunctionWithResponse). If the first
+    // param is anything other than the inbound JSON type (USIOJsonValue*
+    // here), the plugin packs the wrong shape into ProcessEvent and any
+    // additional params receive UNINITIALISED stack memory. We learned
+    // this with an access-violation crash on the first inbound command
+    // ever sent through this binding (2026-06-15). Do NOT add a leading
+    // FString EventName parameter — the event name is implicit from the
+    // binding, and the plugin will silently miscall.
     UFUNCTION()
-    void HandleHeadsetCommandEvent(FString EventName, USIOJsonValue* EventData);
+    void HandleHeadsetCommandEvent(USIOJsonValue* EventData);
 
     void ScheduleTokenRefresh(double ExpiresAtUnixSeconds);
 

@@ -648,6 +648,57 @@ a.btn { text-decoration: none; display: inline-flex; align-items: center; }
 .command-log__line--error { color: var(--color-error); }
 
 /* ============================================================
+   Per-app panel (2026-06-15 — apps/<appId>.js modules)
+   ============================================================ */
+.focus-app-panel {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-2);
+  padding-bottom: var(--space-3);
+  border-bottom: 1px solid var(--color-border);
+}
+.focus-app-panel__state-label {
+  margin: 0;
+  font-family: var(--font-mono);
+  font-size: 11px;
+  color: var(--color-text-muted);
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+}
+.focus-app-panel__body {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-2);
+}
+.focus-app-panel__hint {
+  margin: 0;
+  font-size: var(--font-size-sm);
+  color: var(--color-text-muted);
+}
+.focus-app-panel__fallback,
+.focus-app-panel__vrft {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-2);
+}
+.focus-app-panel__fallback-body {
+  margin: 0;
+  font-size: var(--font-size-sm);
+  color: var(--color-text-muted);
+}
+.focus-app-panel__raw {
+  margin: 0;
+  padding: var(--space-2);
+  background: var(--color-bg);
+  border: 1px solid var(--color-border);
+  border-radius: var(--radius-sm);
+  font-family: var(--font-mono);
+  font-size: 11px;
+  color: var(--color-text-muted);
+  overflow-x: auto;
+}
+
+/* ============================================================
    Faker page
    ============================================================ */
 .faker {

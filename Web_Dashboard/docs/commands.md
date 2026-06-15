@@ -2,8 +2,13 @@
 
 This document is the source of truth for the JSON command payloads that flow
 from the instructor browser through the Socket.IO signaling server to the
-Quest headset. It mirrors `.cursorrules §5.2` and is enforced server-side by
-`Web_Dashboard/src/commands.js`.
+Quest/Pico headset. It mirrors `.cursorrules §5.2` and is enforced
+server-side by `Web_Dashboard/src/commands.js`.
+
+The inverse direction (headset publishing state to the dashboard, e.g.
+"I'm in the hub, here are the available levels") is documented in
+[`state-updates.md`](./state-updates.md). Together they form the per-app
+interactive control plane added 2026-06-15.
 
 ## Transport
 
@@ -62,6 +67,53 @@ Every command is a JSON object with at minimum a string `command` field.
 
 No additional fields. The headset teleports the player back to the level's `PlayerStart`.
 
+## App-specific commands
+
+The four commands above are **app-agnostic** — any VR app should respond to
+them sensibly (pause is pause; reset is reset). Beyond that, each VR app
+defines its own command vocabulary scoped to its `appId` (declared on
+`headset:register` — see [`state-updates.md`](./state-updates.md#application-identity)).
+Server validates app-specific commands against the room's `appId`: a `VRFT`
+command sent to a `VRForklift` session is rejected as unknown for that app.
+
+App-specific validators live in `Web_Dashboard/src/commands.js` under
+`APP_COMMAND_VALIDATORS[appId]`. The forwarding handler looks up the room's
+`appId`, checks the app-scoped table first, then falls back to the global
+`COMMAND_VALIDATORS`. A command with no validator in either table is
+rejected (defence against typos + unknown commands per `.cursorrules §5.2`).
+
+### `appId: "VRFT"` (VR Fire Training)
+
+Mirror of the VRFT state machine documented in [`state-updates.md`](./state-updates.md#appid-vrft-vr-fire-training).
+
+#### `load_level`
+
+```json
+{ "command": "load_level", "level_id": "kitchen_fire" }
+```
+
+| Field | Type | Required | Notes |
+|---|---|---|---|
+| `command` | string | yes | Must be `"load_level"` |
+| `level_id` | string | yes | Non-empty. Must match one of the `id` values the headset most recently published under `data.available_levels` in its `hub` state-update. The dashboard's `apps/VRFT.js` module enforces this client-side by only rendering buttons for currently-published levels; the server enforces shape only (the headset BP is responsible for rejecting unknown level IDs as a last line of defence). |
+
+Valid in states: `hub`, `level_complete`. The headset transitions to
+`level_loading`, then `level_active` once the map finishes loading and
+publishes corresponding state-updates.
+
+#### `return_to_hub`
+
+```json
+{ "command": "return_to_hub" }
+```
+
+| Field | Type | Required | Notes |
+|---|---|---|---|
+| `command` | string | yes | Must be `"return_to_hub"` |
+
+No additional fields. Valid in states: `level_active`, `level_complete`. The
+headset unloads the current level and transitions back to `hub`.
+
 ## Validation rules
 
 - **Server side** (`src/commands.js`):
@@ -74,11 +126,26 @@ No additional fields. The headset teleports the player back to the level's `Play
 
 ## Extending
 
-Additive only. To add a new command:
+Additive only. To add a new app-agnostic command:
 
 1. Add a per-field validator to `COMMAND_VALIDATORS` in `Web_Dashboard/src/commands.js`.
 2. Add a section to this document with the same table shape.
 3. Implement the headset handler in BP.
-4. Add the dispatch UI to the instructor dashboard (Phase 5).
+4. Add the dispatch UI to the instructor dashboard.
+
+To add a new command for a specific VR app:
+
+1. Add a per-field validator to `APP_COMMAND_VALIDATORS[<appId>]` in `Web_Dashboard/src/commands.js`.
+2. Add a row to the corresponding `### appId: "X"` subsection of this document.
+3. Update the per-app dashboard module at `Web_Dashboard/public/js/apps/<appId>.js` to render the dispatch UI for the new command.
+4. Implement the headset handler in BP/C++ for that VR app.
+
+To add a new VR app entirely:
+
+1. Add a new `### appId: "<NewAppId>"` subsection here, with one `####` block per command.
+2. Add the corresponding `APP_COMMAND_VALIDATORS[<NewAppId>]` entry to `Web_Dashboard/src/commands.js`.
+3. Add the state-machine documentation to [`state-updates.md`](./state-updates.md#per-app-state-machine-conventions).
+4. Write the per-app dashboard module at `Web_Dashboard/public/js/apps/<NewAppId>.js`.
+5. Implement the VR-side state publication + command handling in the new project.
 
 Never silently break an existing command's shape — bump a `v2` command name and accept both during a deprecation window if a breaking change is unavoidable.

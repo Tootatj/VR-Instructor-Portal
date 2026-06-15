@@ -18,9 +18,13 @@
 import { lookupRoom } from './pairing.js';
 
 /**
- * Per-command validators. Each returns `null` if the payload is well-formed
- * for that command, or a human-readable error string otherwise. Add new
- * commands here and document them in docs/commands.md in the same PR.
+ * App-agnostic command validators. These commands should work against any
+ * VR app — they're meta-controls (pause, reset, change scene) that any
+ * sensible VR experience can implement. Add new commands here and
+ * document them in docs/commands.md in the same PR.
+ *
+ * Each returns `null` if the payload is well-formed for that command, or
+ * a human-readable error string otherwise.
  */
 const COMMAND_VALIDATORS = {
   pause_simulation: (p) =>
@@ -40,14 +44,57 @@ const COMMAND_VALIDATORS = {
 };
 
 /**
- * Validate a command payload against the §5.2 schema.
- * @returns {string | null} null if valid; an error string otherwise.
+ * Per-app command validators (2026-06-15 — per-app interactive control
+ * plane). Keyed by the room's `appId` (declared in `headset:register` per
+ * docs/state-updates.md#application-identity). When forwarding a command,
+ * the handler looks up the room's appId, checks this table FIRST, then
+ * falls back to COMMAND_VALIDATORS above. A command with no validator in
+ * either table is rejected as unknown.
+ *
+ * Adding a new VR app:
+ *   1. Add a new key here matching the app's `appId` (PascalCase suggested).
+ *   2. Document the commands in docs/commands.md under the matching
+ *      `### appId: "X"` subsection.
+ *   3. Document the corresponding state machine in docs/state-updates.md.
+ *   4. Ship the per-app dashboard module at public/js/apps/<appId>.js.
  */
-export function validateCommand(payload) {
+const APP_COMMAND_VALIDATORS = {
+  // VR Fire Training. State machine + command lifecycle documented in
+  // docs/state-updates.md#appid-vrft-vr-fire-training and
+  // docs/commands.md#appid-vrft-vr-fire-training. The dashboard module
+  // at public/js/apps/VRFT.js is responsible for only rendering buttons
+  // that match the currently-published level list; the server enforces
+  // shape only, the VR side is the final authority on which level IDs
+  // are loadable.
+  VRFT: {
+    load_level: (p) =>
+      typeof p.level_id === 'string' && p.level_id.length > 0
+        ? null
+        : 'load_level.level_id must be a non-empty string',
+    return_to_hub: () => null,
+  },
+};
+
+/**
+ * Validate a command payload against the §5.2 schema.
+ *
+ * @param {object} payload - The command payload.
+ * @param {string|null} appId - The target room's appId, if known. When
+ *   provided, app-specific validators in APP_COMMAND_VALIDATORS[appId]
+ *   are checked first. Legacy callers without appId still work — only
+ *   the global COMMAND_VALIDATORS are consulted.
+ * @returns {string|null} null if valid; an error string otherwise.
+ */
+export function validateCommand(payload, appId = null) {
   if (!payload || typeof payload !== 'object') return 'payload must be an object';
   if (typeof payload.command !== 'string') return 'payload.command must be a string';
-  const validator = COMMAND_VALIDATORS[payload.command];
-  if (!validator) return `unknown command "${payload.command}"`;
+  const appValidators = (appId && APP_COMMAND_VALIDATORS[appId]) || {};
+  const validator = appValidators[payload.command] ?? COMMAND_VALIDATORS[payload.command];
+  if (!validator) {
+    return appId
+      ? `unknown command "${payload.command}" for app "${appId}"`
+      : `unknown command "${payload.command}"`;
+  }
   return validator(payload);
 }
 
@@ -59,10 +106,14 @@ export function registerCommandHandlers(io) {
         return;
       }
 
-      const err = validateCommand(payload);
-      if (err) {
-        console.warn(`[VRIP] command rejected sock=${socket.id}: ${err}`);
-        ack?.({ ok: false, error: err });
+      // Cheap pre-checks before we touch the room map — bail on payloads
+      // that can't possibly route anywhere.
+      if (!payload || typeof payload !== 'object') {
+        ack?.({ ok: false, error: 'payload must be an object' });
+        return;
+      }
+      if (typeof payload.command !== 'string') {
+        ack?.({ ok: false, error: 'payload.command must be a string' });
         return;
       }
 
@@ -86,6 +137,19 @@ export function registerCommandHandlers(io) {
       // specific room.
       if (socket.data.tenantId && room.tenantId !== socket.data.tenantId) {
         ack?.({ ok: false, error: 'target session is in a different tenant' });
+        return;
+      }
+
+      // App-aware validation: app-specific commands (e.g. VRFT's
+      // load_level) only validate against the room's declared appId.
+      // Falls back to global app-agnostic validators (pause_simulation,
+      // reset_user_position, etc.) for cross-app commands. Order
+      // matters: we have to look up the room before validating so the
+      // validator can resolve app-specific commands.
+      const err = validateCommand(payload, room.appId ?? null);
+      if (err) {
+        console.warn(`[VRIP] command rejected sock=${socket.id} code=${targetCode}: ${err}`);
+        ack?.({ ok: false, error: err });
         return;
       }
 

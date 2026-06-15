@@ -128,14 +128,16 @@ per-device channel rename recipe.
 | `GET /api/sessions?page=N&pageSize=M` | browser → server | **cookie** | Paginated active sessions; tenant taken from cookie (URL query removed in Phase 6 for security). |
 | `POST /api/token` | client → server | none | Mints a short-lived RTC token. Body: `{ code, role, uid? }`. Requires the pairing code to already be registered by a headset (no rando minting). |
 | `GET /` | browser → server | cookie | 302 → `/login.html` if no session. **Phase 6**. |
-| Socket.IO `headset:register` | headset → server | none (tenantId must be a known tenant) | Headset (or faker) claims a 4-digit code. Payload: `{ code, tenantId, scenario?, traineeName?, source? }`. Phase 6: rejects unknown tenantIds. |
+| Socket.IO `headset:register` | headset → server | none (tenantId must be a known tenant) | Headset (or faker) claims a 4-digit code. Payload: `{ code, tenantId, scenario?, traineeName?, source?, appId?, appVersion? }`. Phase 6: rejects unknown tenantIds. 2026-06-15: optional `appId`/`appVersion` enable the per-app interactive control plane — see [`docs/state-updates.md`](./docs/state-updates.md#application-identity). |
 | Socket.IO `headset:end` | headset → server | room ownership | Graceful shutdown from the owning headset. Payload: `{ code }`. Server prunes the room immediately instead of waiting on the ~30 s disconnect timeout. |
-| Socket.IO `instructor:subscribe-tenant` | instructor → server | **cookie** | Grid-view subscription. Payload is ignored as of Phase 6 — tenantId taken from cookie. Acks with `{ ok, tenantId, sessions }`. |
+| Socket.IO `headset:state-update` | headset → server | room ownership | **2026-06-15.** Per-app state-machine transition published by the VR app. Payload: `{ code, state, data?, seq? }`. Server caches the latest state on the room + fans out as `session:state-changed`. Sliding 3-second window rate-limited at 30/code, data payload capped at 8 KB. Wire spec: [`docs/state-updates.md`](./docs/state-updates.md). |
+| Socket.IO `instructor:subscribe-tenant` | instructor → server | **cookie** | Grid-view subscription. Payload is ignored as of Phase 6 — tenantId taken from cookie. Acks with `{ ok, tenantId, sessions }`. Sessions list now includes per-app fields (`appId`, `appVersion`, `currentState`) so newly-connecting instructors render the focused-view per-app panel immediately. |
 | Socket.IO `instructor:join` | instructor → server | none | Legacy 1:1 pairing for single-session debug view. Payload: `{ code }`. |
-| Socket.IO `instructor:command` | instructor → server | role=instructor + same-tenant | Dispatch a §5.2 command. Payload includes `code` to target a specific session. Validated server-side. |
+| Socket.IO `instructor:command` | instructor → server | role=instructor + same-tenant | Dispatch a §5.2 command. Payload includes `code` to target a specific session. Validated server-side, now app-aware: app-specific commands (e.g. VRFT's `load_level`) only validate against the target room's declared `appId`. |
 | Socket.IO `headset:command` | server → headset | — | Validated command relayed to the headset socket. |
 | Socket.IO `session:status` | server → both peers in a code | — | Broadcast `{ state: 'waiting' \| 'connected' \| 'reconnecting' \| 'ended' }`. |
-| Socket.IO `sessions:changed` | server → instructor sockets | — | Tenant-scoped broadcast: full updated session list. Fires on headset register/disconnect/end. |
+| Socket.IO `sessions:changed` | server → instructor sockets | — | Tenant-scoped broadcast: full updated session list (now includes per-app fields). Fires on headset register/disconnect/end. |
+| Socket.IO `session:state-changed` | server → instructor sockets in tenant + 1:1 instructor for code | — | **2026-06-15.** Per-app state transition fan-out (driven by `headset:state-update` above). Payload: `{ code, tenantId, appId, appVersion, state, data, updatedAt, seq? }`. Drives the dashboard's `apps/<appId>.js` module re-render. |
 
 See `docs/commands.md` for the canonical command schema enforced by
 `src/commands.js`.
@@ -153,7 +155,10 @@ The UE-side wire-protocol sequence on cold launch:
    `VR_Project/Config/DefaultGame.ini` section
    `[/Script/VR_Project.SignalingSubsystem]`).
 2. Emits `headset:register` with `{ code, tenantId, scenario,
-   traineeName, source:"headset" }` + ack callback.
+   traineeName, source:"headset", appId?, appVersion? }` + ack callback.
+   The `appId` / `appVersion` fields (added 2026-06-15) opt the headset
+   into the per-app interactive control plane — see
+   [`docs/state-updates.md`](./docs/state-updates.md#application-identity).
 3. On ack `ok`, POSTs `/api/token` for `{ code, role:"publisher", uid:0 }`.
 4. Stores returned `appId`, `token`, `channel`, `expiresAt` and fires
    the `OnCredentialsReady` BP delegate. `BP_VRPawn::BeginPlay` is

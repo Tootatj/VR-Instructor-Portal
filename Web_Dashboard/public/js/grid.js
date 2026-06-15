@@ -16,6 +16,16 @@
 //   - Sessions list comes from `/api/sessions` on first load, then live via
 //     `sessions:changed` over Socket.IO.
 //   - Tokens are minted per-channel via `POST /api/token`.
+//   - 2026-06-15: per-app dashboard panels. The focused session's `appId`
+//     drives dynamic-import of `apps/<appId>.js`. Live state transitions
+//     arrive as `session:state-changed` events and are forwarded to the
+//     per-app module's update() hook. See public/js/apps/README.md.
+
+import {
+  mountAppPanel,
+  updateAppPanel,
+  unmountAppPanel,
+} from './apps/_loader.js';
 
 // ---------- state -----------------------------------------------------------
 const PAGE_SIZE = 6;
@@ -68,6 +78,12 @@ const volumeSlider     = document.getElementById('volume-slider');
 const volumeValue      = document.getElementById('volume-value');
 
 const commandLog       = document.getElementById('command-log');
+const focusAppPanel    = document.getElementById('focus-app-panel');
+
+// Module-scoped socket reference. Captured once in boot() so per-app
+// command dispatch (built around mountAppPanel's sendCommand callback)
+// can reach the socket without threading it through enterFocusMode().
+let socketRef = null;
 
 // ---------- boot ------------------------------------------------------------
 boot().catch((err) => {
@@ -120,6 +136,7 @@ async function boot() {
   // handler can ignore any tenantId the client tries to send.
   setConn('connecting', 'Connecting to signaling…');
   const socket = io({ path: '/socket.io', withCredentials: true });
+  socketRef = socket;
   socket.on('connect', async () => {
     const ack = await emitWithAck(socket, 'instructor:subscribe-tenant', {});
     if (!ack?.ok) {
@@ -139,6 +156,35 @@ async function boot() {
   socket.on('sessions:changed', ({ sessions }) => {
     state.sessions = sessions ?? [];
     rerender();
+  });
+  // 2026-06-15 per-app interactive control plane (docs/state-updates.md).
+  // Server fans this out whenever a headset publishes EmitStateUpdate.
+  // We patch the matching session in state.sessions so the snapshot
+  // stays authoritative (e.g. for re-focus after switching tiles), then
+  // forward to the active per-app module so its update() hook can
+  // re-render. The grid view itself doesn't re-render on state changes —
+  // tile metadata (scenario/trainee/video) is unaffected by per-app state.
+  socket.on('session:state-changed', (evt) => {
+    const idx = state.sessions.findIndex((s) => s.code === evt.code);
+    if (idx >= 0) {
+      const merged = {
+        ...state.sessions[idx],
+        appId: evt.appId ?? state.sessions[idx].appId,
+        appVersion: evt.appVersion ?? state.sessions[idx].appVersion,
+        currentState: {
+          name: evt.state,
+          data: evt.data,
+          updatedAt: evt.updatedAt,
+          ...(evt.seq !== undefined ? { seq: evt.seq } : {}),
+        },
+      };
+      state.sessions[idx] = merged;
+      // If this is the focused session, push the update to the per-app
+      // panel. Otherwise it's just a background snapshot refresh.
+      if (state.focused?.code === evt.code) {
+        updateAppPanel(merged);
+      }
+    }
   });
   socket.on('disconnect', () => {
     setConn('error', 'Signaling disconnected — retrying…');
@@ -396,6 +442,23 @@ async function enterFocusMode(code) {
   };
   refreshFocusMeta();
 
+  // Per-app panel. Awaited so a slow dynamic-import (first focus per
+  // appId per page-load) doesn't race the Agora join below — both are
+  // independent, but keeping the panel-mount synchronous-feeling makes
+  // the UI predictable. Errors during mount fall back internally;
+  // grid.js never sees them.
+  mountAppPanel({
+    container: focusAppPanel,
+    session,
+    sendCommand: makeFocusCommandSender(),
+    logCommand,
+  }).catch((err) => {
+    // Already handled inside the loader (it falls back to _fallback.js),
+    // but log here too so the dashboard console shows it under the focus-
+    // mode context where it's relevant.
+    console.warn('[grid] per-app panel mount failed', err);
+  });
+
   const tokenInfo = await fetchToken(session.code, 'publisher');
   const client = AgoraRTC.createClient({ mode: 'rtc', codec: 'h264' });
   state.focused.client = client;
@@ -452,6 +515,11 @@ async function exitFocusMode() {
     }
   } catch { /* ignore */ }
   try { await f.client?.leave(); } catch { /* ignore */ }
+
+  // Tear down the per-app panel after the Agora teardown so any
+  // in-flight commands the panel might emit during unmount still have
+  // a live socket (they shouldn't — but defence in depth).
+  unmountAppPanel();
 
   focusView.hidden = true;
   gridView.hidden = false;
@@ -563,6 +631,37 @@ function logCommand(msg, kind) {
   commandLog.prepend(line);
   // Keep only the last 12 entries.
   while (commandLog.children.length > 12) commandLog.lastChild.remove();
+}
+
+// 2026-06-15 per-app interactive control plane. Build the sendCommand
+// callback that per-app modules (apps/<appId>.js) call to dispatch a
+// command. Auto-injects the focused session's `code` and logs the
+// outcome to the command log — per-app modules never touch the socket
+// directly. Returned as a factory so the closure captures the focused
+// code AT THE TIME OF FOCUS, not at panel-mount time (defence against
+// the focused session changing under the panel; in practice focus
+// switch always unmounts + re-mounts the panel, so this never differs,
+// but the factory keeps the contract obvious).
+function makeFocusCommandSender() {
+  const code = state.focused?.code ?? null;
+  return async (command, payload = {}) => {
+    if (!socketRef) {
+      logCommand(`✗ ${command}: socket not ready`, 'error');
+      return { ok: false, error: 'socket not ready' };
+    }
+    if (!code) {
+      logCommand(`✗ ${command}: no focused session`, 'error');
+      return { ok: false, error: 'no focused session' };
+    }
+    const fullPayload = { ...payload, command, code };
+    const ack = await emitWithAck(socketRef, 'instructor:command', fullPayload);
+    if (ack?.ok) {
+      logCommand(`→ ${command} (code ${code})`, 'ok');
+    } else {
+      logCommand(`✗ ${command}: ${ack?.error ?? 'failed'}`, 'error');
+    }
+    return ack;
+  };
 }
 
 // ---------- instructor header (Phase 6) -------------------------------------

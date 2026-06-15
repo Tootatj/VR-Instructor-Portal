@@ -16,6 +16,18 @@ import { isKnownTenant } from './tenants.js';
 
 const CODE_PATTERN = /^\d{4}$/;
 const TENANT_PATTERN = /^[a-zA-Z0-9_-]{1,32}$/;
+const APP_ID_PATTERN = /^[A-Za-z][A-Za-z0-9_-]{0,31}$/;
+const STATE_NAME_PATTERN = /^[a-z][a-z0-9_]{0,63}$/;
+const MAX_STATE_DATA_BYTES = 8 * 1024;
+
+// Per-code state-update rate limiter (2026-06-15 — docs/state-updates.md).
+// Sliding 3-second window, max 30 updates per code per window (≈10/s avg,
+// burst of 30). Excess updates are dropped silently — the headset is
+// expected to debounce on its side; this is a defence-in-depth safety net
+// against a malformed BP graph that ticks every frame.
+const STATE_UPDATE_WINDOW_MS = 3000;
+const STATE_UPDATE_MAX_PER_WINDOW = 30;
+const stateUpdateTimestamps = new Map(); // code → number[]
 
 /**
  * Map<code, {
@@ -26,6 +38,17 @@ const TENANT_PATTERN = /^[a-zA-Z0-9_-]{1,32}$/;
  *   traineeName?: string,             // free-form label, e.g. "Trainee 47"
  *   source?: 'headset' | 'faker',     // for debug + UI tagging
  *   startedAt: number,                // unix-ms when the room was first created
+ *
+ *   // 2026-06-15 — per-app interactive control plane. See
+ *   // docs/state-updates.md for the wire spec.
+ *   appId?: string,                   // e.g. "VRFT" (per docs/state-updates.md APP_ID_PATTERN)
+ *   appVersion?: string,              // free-form, truncated to 32 chars
+ *   currentState?: {
+ *     name: string,                   // state-machine label, e.g. "hub" (STATE_NAME_PATTERN)
+ *     data: object,                   // app-specific payload (≤ MAX_STATE_DATA_BYTES serialised)
+ *     updatedAt: number,              // unix-ms of last update
+ *     seq?: number,                   // optional monotonic seq for out-of-order rejection
+ *   }
  * }>
  */
 const ROOMS = new Map();
@@ -44,6 +67,12 @@ export function lookupRoom(code) {
  * so the grid view stays visually stable as new sessions appear at the end.
  * Sessions without a connected headset are filtered out — a "ghost" room
  * with only an instructor pinned shouldn't show up as a live tile.
+ *
+ * Includes per-app fields (appId, appVersion, currentState) so a newly-
+ * connecting instructor's focus view can render the correct per-app panel
+ * with the current state immediately, without waiting for the next
+ * state-update tick. Sessions whose headset never declared an appId get
+ * `appId: null` and the dashboard renders a generic fallback panel.
  */
 export function listSessionsForTenant(tenantId) {
   const out = [];
@@ -57,6 +86,9 @@ export function listSessionsForTenant(tenantId) {
       traineeName: room.traineeName ?? null,
       source: room.source ?? 'headset',
       startedAt: room.startedAt,
+      appId: room.appId ?? null,
+      appVersion: room.appVersion ?? null,
+      currentState: room.currentState ?? null,
     });
   }
   out.sort((a, b) => a.startedAt - b.startedAt);
@@ -111,6 +143,22 @@ export function registerPairingHandlers(io) {
       if (typeof payload?.scenario === 'string')    room.scenario = payload.scenario.slice(0, 64);
       if (typeof payload?.traineeName === 'string') room.traineeName = payload.traineeName.slice(0, 64);
       room.source = payload?.source === 'faker' ? 'faker' : 'headset';
+
+      // 2026-06-15 per-app interactive control plane. appId is optional
+      // for backward-compat (existing VR builds register without it and
+      // get the generic fallback panel in the dashboard). When present,
+      // it must match APP_ID_PATTERN to keep the dynamic module-loader
+      // path (apps/<appId>.js) safe against traversal/injection. We
+      // intentionally accept appId on re-registers — a single headset
+      // could in principle swap VR apps without disconnecting, though
+      // today's flow is one app per cold-launch.
+      if (typeof payload?.appId === 'string' && APP_ID_PATTERN.test(payload.appId)) {
+        room.appId = payload.appId;
+      }
+      if (typeof payload?.appVersion === 'string') {
+        room.appVersion = payload.appVersion.slice(0, 32);
+      }
+
       ROOMS.set(code, room);
 
       socket.data.role = 'headset';
@@ -121,6 +169,7 @@ export function registerPairingHandlers(io) {
       console.log(
         `[VRIP] headset:register code=${code} tenant=${tenantId} ` +
         `scenario="${room.scenario ?? ''}" trainee="${room.traineeName ?? ''}" ` +
+        `app=${room.appId ?? '(none)'}${room.appVersion ? `@${room.appVersion}` : ''} ` +
         `source=${room.source} sock=${socket.id}`
       );
 
@@ -129,6 +178,99 @@ export function registerPairingHandlers(io) {
         state: room.instructorSocketId ? 'connected' : 'waiting',
       });
       broadcastSessionsChanged(io, tenantId);
+    });
+
+    // -------------------------------------------------------------------
+    // headset:state-update — per-app state machine transition from headset
+    // -------------------------------------------------------------------
+    // Wire format: docs/state-updates.md (2026-06-15 — per-app interactive
+    // control plane). The headset emits this whenever its app-specific
+    // state machine transitions (e.g. VRFT moving from "boot" → "hub" →
+    // "level_loading" → "level_active"). The server validates the shape,
+    // caches the latest state on the room (so newly-connecting instructors
+    // get it immediately via `sessions:changed`), and fans out a
+    // `session:state-changed` event to subscribed instructor sockets.
+    //
+    // Authz: only the socket that's the room's current headsetSocketId can
+    // push state for it (defence-in-depth against socket hijacking).
+    //
+    // Rate-limited per code (see STATE_UPDATE_WINDOW_MS above): excess
+    // updates dropped silently. The headset BP/C++ is expected to emit
+    // once per real state transition, not once per frame.
+    socket.on('headset:state-update', (payload, ack) => {
+      const code = payload?.code;
+      if (!CODE_PATTERN.test(code ?? '')) {
+        ack?.({ ok: false, error: 'code must be a 4-digit string' });
+        return;
+      }
+      const room = ROOMS.get(code);
+      if (!room) {
+        ack?.({ ok: false, error: 'no active room for this code' });
+        return;
+      }
+      if (room.headsetSocketId !== socket.id) {
+        ack?.({ ok: false, error: 'not the owning headset' });
+        return;
+      }
+
+      const stateName = payload?.state;
+      if (typeof stateName !== 'string' || !STATE_NAME_PATTERN.test(stateName)) {
+        ack?.({ ok: false, error: 'state must be a lowercase snake_case string (≤64 chars)' });
+        return;
+      }
+
+      const data = payload?.data ?? {};
+      if (data !== null && typeof data !== 'object') {
+        ack?.({ ok: false, error: 'data must be an object' });
+        return;
+      }
+      // Size cap — bound the per-room memory footprint regardless of what
+      // a VR app decides to push. 8 KB is generous for state-display
+      // payloads (a level list of 50 entries fits comfortably).
+      let serialisedDataBytes;
+      try {
+        serialisedDataBytes = Buffer.byteLength(JSON.stringify(data), 'utf8');
+      } catch {
+        ack?.({ ok: false, error: 'data must be JSON-serialisable' });
+        return;
+      }
+      if (serialisedDataBytes > MAX_STATE_DATA_BYTES) {
+        ack?.({ ok: false, error: `data exceeds ${MAX_STATE_DATA_BYTES} bytes` });
+        return;
+      }
+
+      // Optional monotonic seq for out-of-order rejection. If both old and
+      // new have a seq, new must be >= old. If either is missing, last-
+      // write-wins (the common case — most apps won't bother with seq).
+      const seq = Number.isInteger(payload?.seq) ? payload.seq : undefined;
+      const prevSeq = room.currentState?.seq;
+      if (seq !== undefined && prevSeq !== undefined && seq < prevSeq) {
+        ack?.({ ok: true, dropped: 'out-of-order' });
+        return;
+      }
+
+      // Rate-limit.
+      if (!checkStateUpdateRateLimit(code)) {
+        ack?.({ ok: false, error: 'rate limit exceeded' });
+        return;
+      }
+
+      const now = Date.now();
+      const prevName = room.currentState?.name;
+      room.currentState = { name: stateName, data, updatedAt: now, ...(seq !== undefined ? { seq } : {}) };
+
+      // Log transitions (state change), not every refresh (same state with
+      // updated data). Avoids log spam from periodic in-state progress
+      // updates while still surfacing the lifecycle events that matter.
+      if (prevName !== stateName) {
+        console.log(
+          `[VRIP] headset:state-update code=${code} app=${room.appId ?? '(none)'} ` +
+          `state=${prevName ?? '(none)'} → ${stateName} sock=${socket.id}`
+        );
+      }
+
+      ack?.({ ok: true });
+      broadcastStateChanged(io, room.tenantId, code, room);
     });
 
     // -------------------------------------------------------------------
@@ -168,6 +310,7 @@ export function registerPairingHandlers(io) {
       io.to(roomName(code)).emit('session:status', { state: 'ended' });
 
       ROOMS.delete(code);
+      stateUpdateTimestamps.delete(code);
       console.log(`[VRIP] headset:end code=${code} tenant=${tenantId} sock=${socket.id}`);
 
       ack?.({ ok: true });
@@ -279,6 +422,7 @@ export function registerPairingHandlers(io) {
       const headsetGone = !room.headsetSocketId;
       if (!room.headsetSocketId && !room.instructorSocketId) {
         ROOMS.delete(code);
+        stateUpdateTimestamps.delete(code);
         console.log(`[VRIP] room pruned: code=${code}`);
       }
 
@@ -296,6 +440,51 @@ function broadcastSessionsChanged(io, tenantId) {
     tenantId,
     sessions: listSessionsForTenant(tenantId),
   });
+}
+
+/**
+ * Fan-out a per-app state transition to every instructor watching this
+ * tenant (grid view) and to the legacy 1:1 instructor pinned to this
+ * specific code (single-session debug view). Socket.IO dedupes if a
+ * socket is somehow in both rooms.
+ *
+ * Wire format mirrors what listSessionsForTenant emits per-session so
+ * dashboard code can use a single rendering path whether the data
+ * arrived as part of a sessions:changed snapshot or a live
+ * session:state-changed event.
+ */
+function broadcastStateChanged(io, tenantId, code, room) {
+  const payload = {
+    tenantId,
+    code,
+    appId: room.appId ?? null,
+    appVersion: room.appVersion ?? null,
+    state: room.currentState.name,
+    data: room.currentState.data,
+    updatedAt: room.currentState.updatedAt,
+    ...(room.currentState.seq !== undefined ? { seq: room.currentState.seq } : {}),
+  };
+  io.to(tenantRoomName(tenantId)).to(roomName(code)).emit('session:state-changed', payload);
+}
+
+/**
+ * Sliding-window rate limiter for per-code state updates. Returns true
+ * if this update should be accepted, false if dropped. Mutates the
+ * stateUpdateTimestamps map in place.
+ */
+function checkStateUpdateRateLimit(code) {
+  const now = Date.now();
+  let ts = stateUpdateTimestamps.get(code) ?? [];
+  const windowStart = now - STATE_UPDATE_WINDOW_MS;
+  ts = ts.filter((t) => t >= windowStart);
+  if (ts.length >= STATE_UPDATE_MAX_PER_WINDOW) {
+    // Persist the trimmed array so we don't redo the filter on every drop.
+    stateUpdateTimestamps.set(code, ts);
+    return false;
+  }
+  ts.push(now);
+  stateUpdateTimestamps.set(code, ts);
+  return true;
 }
 
 function roomName(code) {

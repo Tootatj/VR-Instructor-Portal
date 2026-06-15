@@ -257,13 +257,25 @@ Rules:
 # ----------------------------------------------------------------------------
 
 ## 5.1 Pairing (Socket.IO events)
-- `headset:register`     payload: `{ "code": "1234" }`
+- `headset:register`     payload: `{ "code": "1234", "tenantId"?: string,
+                                      "scenario"?: string, "traineeName"?: string,
+                                      "source"?: "headset"|"faker",
+                                      "appId"?: string, "appVersion"?: string }`
                          emitted by: VR client on launch / reconnect
+                         Note: appId / appVersion (added 2026-06-15) enable
+                         the per-app interactive control plane (§5.3).
 - `instructor:join`      payload: `{ "code": "1234" }`
-                         emitted by: web dashboard on submit
-- `session:status`       payload: `{ "state": "waiting" | "connected" | "reconnecting" }`
+                         emitted by: web dashboard on submit (legacy 1:1 mode)
+- `instructor:subscribe-tenant`
+                         payload: `{}` (tenantId read from session cookie)
+                         emitted by: grid-view instructors on connect
+- `headset:end`          payload: `{ "code": "1234" }`
+                         emitted by: VR client on Deinitialize (graceful shutdown)
+- `session:status`       payload: `{ "state": "waiting" | "connected" | "reconnecting" | "ended" }`
                          emitted by: server → both peers
 - `session:end`          payload: `{ "reason": "string" }`
+- `sessions:changed`     payload: `{ "tenantId": string, "sessions": [...] }`
+                         emitted by: server → instructor sockets in tenant room
 
 ## 5.2 Canonical Command Payloads (Instructor → Headset)
 All commands are JSON objects with at minimum a `command` field. The
@@ -286,7 +298,29 @@ Rules:
 - Unknown commands MUST be ignored by the headset and logged by the
   server. Never crash on a malformed payload.
 - Extensions are allowed but must be additive and documented in
-  `/Web_Dashboard/docs/commands.md` (create if missing).
+  `/Web_Dashboard/docs/commands.md`.
+
+App-specific commands (added 2026-06-15) live in the same command channel
+but are scoped to a specific `appId` declared on `headset:register`. The
+server validates them against `APP_COMMAND_VALIDATORS[<appId>]` in
+`Web_Dashboard/src/commands.js`, falling back to the four cross-app
+commands above. Per-appId schema + reference VRFT module documented in
+`/Web_Dashboard/docs/commands.md` (App-specific commands section).
+
+## 5.3 State updates (Headset → Instructor)
+
+Added 2026-06-15. The inverse direction of §5.2 — a headset publishes its
+app-specific state machine transitions so the dashboard can render a
+per-app instructor UI (level picker, scenario status, in-level controls).
+Event: `headset:state-update` (headset → server), fan-out as
+`session:state-changed` (server → instructors). Wire format + per-appId
+state-machine conventions: `/Web_Dashboard/docs/state-updates.md`.
+
+Same rules as §5.2 apply: snake_case JSON, additive extensions, never
+crash on malformed input. Server caches the latest state per room +
+size-caps data payloads at 8 KB. Per-app dashboard modules live at
+`/Web_Dashboard/public/js/apps/<appId>.js`; convention in
+`/Web_Dashboard/public/js/apps/README.md`.
 
 
 # 6. PERFORMANCE & QUALITY BARS

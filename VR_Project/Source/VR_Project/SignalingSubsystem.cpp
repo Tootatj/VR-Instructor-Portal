@@ -71,8 +71,10 @@ void USignalingSubsystem::Initialize(FSubsystemCollectionBase& Collection)
     }
 
     UE_LOG(LogVRIPSignaling, Log,
-        TEXT("Initialize: code=%s tenant=%s server=%s scenario=\"%s\" trainee=\"%s\""),
-        *PairingCode, *TenantId, *ServerUrl, *Scenario, *TraineeName);
+        TEXT("Initialize: code=%s tenant=%s server=%s scenario=\"%s\" trainee=\"%s\" app=%s%s"),
+        *PairingCode, *TenantId, *ServerUrl, *Scenario, *TraineeName,
+        AppId.IsEmpty() ? TEXT("(none)") : *AppId,
+        AppVersion.IsEmpty() ? TEXT("") : *FString::Printf(TEXT("@%s"), *AppVersion));
 
     // Defer the socket boot if the device hasn't registered yet AND
     // the registry is in strict mode. The UMG gate (or any custom
@@ -155,6 +157,19 @@ void USignalingSubsystem::LoadConfig()
     if (!GConfig->GetString(Section, TEXT("TraineeName"), TraineeName, GGameIni))
     {
         TraineeName = TEXT("Demo Trainee");
+    }
+
+    // 2026-06-15 — per-app interactive control plane. Both AppId and
+    // AppVersion are optional; an empty AppId means "no app declared"
+    // and the dashboard renders a generic video-only panel (backward
+    // compat for pre-2026-06-15 VR builds that have no INI entry).
+    if (!GConfig->GetString(Section, TEXT("AppId"), AppId, GGameIni))
+    {
+        AppId.Reset();
+    }
+    if (!GConfig->GetString(Section, TEXT("AppVersion"), AppVersion, GGameIni))
+    {
+        AppVersion.Reset();
     }
 }
 
@@ -365,6 +380,16 @@ void USignalingSubsystem::EmitHeadsetRegister()
     Payload->SetStringField(TEXT("scenario"),     Scenario);
     Payload->SetStringField(TEXT("traineeName"), TraineeName);
     Payload->SetStringField(TEXT("source"),       TEXT("headset"));
+    // 2026-06-15 — per-app fields are only included when set, so
+    // pre-2026-06-15 server builds still see the legacy payload shape.
+    if (!AppId.IsEmpty())
+    {
+        Payload->SetStringField(TEXT("appId"), AppId);
+    }
+    if (!AppVersion.IsEmpty())
+    {
+        Payload->SetStringField(TEXT("appVersion"), AppVersion);
+    }
 
     TWeakObjectPtr<USignalingSubsystem> WeakThis(this);
 
@@ -583,7 +608,13 @@ void USignalingSubsystem::ScheduleTokenRefresh(double ExpiresAtUnixSeconds)
 
 // --- headset:command inbound -------------------------------------------------
 
-void USignalingSubsystem::HandleHeadsetCommandEvent(FString EventName, USIOJsonValue* EventData)
+// CRITICAL: signature MUST be (USIOJsonValue*) only — see the matching
+// note on the .h declaration. SocketIO plugin's BindEventToFunction
+// inspects only the first param and packs ProcessEvent args accordingly;
+// any leading non-USIOJsonValue param results in garbage stack memory
+// being passed for subsequent params. Got bitten on 2026-06-15 first
+// inbound-command test.
+void USignalingSubsystem::HandleHeadsetCommandEvent(USIOJsonValue* EventData)
 {
     if (!EventData)
     {
@@ -609,9 +640,9 @@ void USignalingSubsystem::HandleHeadsetCommandEvent(FString EventName, USIOJsonV
         return;
     }
 
-    // Cherry-pick only the schema-relevant fields per docs/commands.md.
-    // Unknown commands still flow through — BP is the canonical place to
-    // ignore unknowns per .cursorrules §5.2.
+    // Cherry-pick only the schema-relevant fields per docs/commands.md
+    // for the four legacy app-agnostic commands. Back-compat: existing BP
+    // graphs that read BoolValue/StringValue keep working unchanged.
     if (Cmd.Command == TEXT("pause_simulation"))
     {
         Obj->TryGetBoolField(TEXT("value"), Cmd.BoolValue);
@@ -625,11 +656,95 @@ void USignalingSubsystem::HandleHeadsetCommandEvent(FString EventName, USIOJsonV
         Obj->TryGetStringField(TEXT("event_type"), Cmd.StringValue);
     }
 
+    // 2026-06-15 — also serialise the full JSON so per-app commands
+    // (e.g. VRFT's "load_level": { level_id: "kitchen_fire" }) parse
+    // cleanly in BP via the SocketIO plugin's two-step "Construct Json
+    // Object" → "Decode Json" pattern (both under category SIOJ | Json).
+    // Unknown commands still flow through with PayloadJson populated —
+    // BP is the canonical place to ignore unknowns per .cursorrules §5.2.
+    {
+        const TSharedRef<TJsonWriter<TCHAR, TCondensedJsonPrintPolicy<TCHAR>>> Writer =
+            TJsonWriterFactory<TCHAR, TCondensedJsonPrintPolicy<TCHAR>>::Create(&Cmd.PayloadJson);
+        FJsonSerializer::Serialize(Obj.ToSharedRef(), Writer);
+    }
+
+    // Truncate the logged payload — a chatty command (or a malformed one)
+    // shouldn't dump kilobytes into the device log.
+    const FString LoggedPayload = Cmd.PayloadJson.Len() > 200
+        ? Cmd.PayloadJson.Left(200) + TEXT("...(truncated)")
+        : Cmd.PayloadJson;
     UE_LOG(LogVRIPSignaling, Log,
-        TEXT("headset:command %s bool=%d str=\"%s\""),
-        *Cmd.Command, Cmd.BoolValue ? 1 : 0, *Cmd.StringValue);
+        TEXT("headset:command %s payload=%s"),
+        *Cmd.Command, *LoggedPayload);
 
     OnHeadsetCommand.Broadcast(Cmd);
+}
+
+// --- headset:state-update outbound (2026-06-15 per-app control plane) -------
+
+void USignalingSubsystem::EmitStateUpdate(const FString& StateName, USIOJsonObject* Data)
+{
+    TSharedPtr<FJsonObject> DataObj = (Data ? Data->GetRootObject() : nullptr);
+    EmitStateUpdateInternal(StateName, DataObj);
+}
+
+void USignalingSubsystem::EmitStateUpdateFromJson(const FString& StateName, const FString& DataJsonString)
+{
+    TSharedPtr<FJsonObject> DataObj;
+    if (!DataJsonString.IsEmpty())
+    {
+        const TSharedRef<TJsonReader<>> Reader = TJsonReaderFactory<>::Create(DataJsonString);
+        if (!FJsonSerializer::Deserialize(Reader, DataObj) || !DataObj.IsValid())
+        {
+            // Parse failure — log loudly but DON'T drop the transition.
+            // A state-update with stale/missing data fields is recoverable
+            // (the per-app dashboard module just renders what it can);
+            // a dropped transition leaves the dashboard stuck on the
+            // previous state forever and is much worse.
+            const FString Truncated = DataJsonString.Len() > 200
+                ? DataJsonString.Left(200) + TEXT("...(truncated)")
+                : DataJsonString;
+            UE_LOG(LogVRIPSignaling, Warning,
+                TEXT("EmitStateUpdateFromJson(%s): data JSON failed to parse, emitting with no data: %s"),
+                *StateName, *Truncated);
+            DataObj = nullptr;
+        }
+    }
+    EmitStateUpdateInternal(StateName, DataObj);
+}
+
+void USignalingSubsystem::EmitStateUpdateInternal(const FString& StateName, TSharedPtr<FJsonObject> Data)
+{
+    if (!Socket || State == ESignalingState::Disconnected)
+    {
+        UE_LOG(LogVRIPSignaling, Verbose,
+            TEXT("EmitStateUpdate(%s): no socket / disconnected, dropping"), *StateName);
+        return;
+    }
+    if (StateName.IsEmpty())
+    {
+        UE_LOG(LogVRIPSignaling, Warning, TEXT("EmitStateUpdate: empty state name — call ignored"));
+        return;
+    }
+
+    TSharedPtr<FJsonObject> Payload = MakeShared<FJsonObject>();
+    Payload->SetStringField(TEXT("code"),  PairingCode);
+    Payload->SetStringField(TEXT("state"), StateName);
+
+    if (Data.IsValid())
+    {
+        Payload->SetObjectField(TEXT("data"), Data);
+    }
+
+    // Fire-and-forget — the server's ack is diagnostic only, BP doesn't
+    // need to handle success/failure (the dashboard will resync on next
+    // emission if this one dropped due to rate-limit or transient
+    // connectivity).
+    Socket->EmitNative(TEXT("headset:state-update"), Payload, nullptr);
+
+    UE_LOG(LogVRIPSignaling, Log,
+        TEXT("EmitStateUpdate: code=%s state=%s data=%s"),
+        *PairingCode, *StateName, Data.IsValid() ? TEXT("(present)") : TEXT("(none)"));
 }
 
 // --- headset:end (graceful shutdown) ----------------------------------------
