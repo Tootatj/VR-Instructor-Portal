@@ -130,6 +130,20 @@
             <span class="command-btn__hint">reset_user_position</span>
           </button>
 
+          <!-- 2026-06-15 (Phase 7 instructor-view rebuild): Mixed-Reality
+               toggle. App-agnostic in protocol, opt-in in implementation.
+               Quest composites the rear-camera passthrough over the VR view;
+               Pico no-ops (no PICOXR seethrough path yet). Headset confirms
+               with a state-update carrying data.mr_enabled. -->
+          <button type="button" class="command-btn" data-command="set_mr_mode" data-value="true">
+            <span class="command-btn__label">Enable MR overlay</span>
+            <span class="command-btn__hint">set_mr_mode:true</span>
+          </button>
+          <button type="button" class="command-btn" data-command="set_mr_mode" data-value="false">
+            <span class="command-btn__label">Disable MR overlay</span>
+            <span class="command-btn__hint">set_mr_mode:false</span>
+          </button>
+
           <div class="command-form">
             <label class="field">
               <span class="field__label">Change environment (map name)</span>

@@ -66,9 +66,16 @@ drive in-simulation behavior.
 
 ## 1.3 Video / Audio Streaming Engine
 - Provider: **Agora RTC SDK**.
-- Video pipeline on the headset:
-    UE Scene → SceneCaptureComponent2D → Render Target →
-    push as **custom video source** to Agora.
+- Video pipeline on the headset (Phase 7 — frame hijacking, verified Quest 3):
+    UE stereo frame → `URenderHijackingSubsystem` /
+    `FSceneColorCopyViewExtension` (right-eye copy, 1280×720) →
+    `BP_InstructorViewLogic` composite (`M_InstructorView` +
+    `DrawMaterialToRenderTarget`) → `RT_InstructorView` →
+    `UAgoraVideoPump::SourceRT` → push as **custom video source**
+    to Agora. Optional Quest MR overlay via `set_mr_mode` +
+    AndroidMedia `vidcap://rear` (Pico MR no-ops cleanly).
+- Legacy fallback (deprecated, kept disabled in `BP_VRPawn` for
+  revert only): SceneCaptureComponent2D → `RT_InstructorStream`.
 - Streaming spec is **HARD-LOCKED** at:
     • Resolution : **1280 × 720**
     • Framerate  : **30 fps**
@@ -191,11 +198,14 @@ Rules:
       depends on a clean Blueprint-callable API.
     • Use a dedicated Agora UE plugin for video/audio.
 - Performance:
-    • SceneCaptureComponent2D MUST render at 1280×720 only, capture
-      on a fixed 30 Hz schedule (NOT every tick), and write to a
-      dedicated RenderTarget that is reused (never reallocated per
-      frame).
-    • Disable bCaptureEveryFrame; drive captures from a timer.
+    • Instructor stream: frame hijacking at 1280×720 (no second
+      scene render). `BP_InstructorViewLogic` composites to
+      `RT_InstructorView` on a 30 Hz tick/timer — NOT every engine
+      tick at full rate.
+    • `RT_InstructorView` format MUST be `RTF_RGBA8_SRGB` (same
+      linear/sRGB readback rule as the legacy SceneCapture path).
+    • If using the legacy SceneCapture fallback: 1280×720 only,
+      fixed 30 Hz timer, `bCaptureEveryFrame=false`, reuse one RT.
     • Avoid dynamic material instance creation on hot paths.
     • No `Tick` on actors that don't need it — set
       `PrimaryActorTick.bCanEverTick = false` by default.
@@ -293,6 +303,13 @@ following four MUST be supported exactly as specified:
   • User Reset
         { "command": "reset_user_position" }
 
+The following is app-agnostic in *protocol* but opt-in in *implementation*
+(pure-VR apps without passthrough capability are expected to no-op cleanly
+per the unknown-command rule below):
+
+  • Set Mixed-Reality Mode (added 2026-06-15, Phase 7 instructor-view rebuild)
+        { "command": "set_mr_mode", "enabled": true | false }
+
 Rules:
 - Field names are `snake_case` in JSON (consistent with the spec).
 - Unknown commands MUST be ignored by the headset and logged by the
@@ -337,7 +354,10 @@ size-caps data payloads at 8 KB. Per-app dashboard modules live at
 # 7. ANTI-PATTERNS — DO NOT DO
 # ----------------------------------------------------------------------------
 - ❌ Do not raise stream resolution or framerate above 720p/30fps.
-- ❌ Do not drive SceneCapture from Tick or capture every frame.
+- ❌ Do not re-enable SceneCapture for the instructor stream when
+  the hijack path is active — it doubles GPU cost for no benefit.
+- ❌ Do not drive SceneCapture from Tick or capture every frame
+  (legacy path only).
 - ❌ Do not put Agora App IDs, tokens, or any secret in client code.
 - ❌ Do not introduce a front-end framework (React/Vue/etc.) without
      explicit instruction.

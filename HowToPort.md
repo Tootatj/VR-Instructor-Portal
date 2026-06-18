@@ -1,9 +1,11 @@
 # How to Port the VR Instructor Portal into Another Unreal Project
 
-> **Last verified against:** UE 5.5.4 · PICOXR 3.4.1 · SocketIOClient v2.9.0 · Agora-Unreal-RTC-SDK v4.5.1 · `USignalingSubsystem` + `UTenantRegistry` + `UHeadsetPresenceMonitor` git rev `<this commit>` (per-app interactive control plane)
+> **Last verified against:** UE 5.5.4 · PICOXR 3.4.1 · SocketIOClient v2.9.0 · Agora-Unreal-RTC-SDK v4.5.1 · `USignalingSubsystem` + `UTenantRegistry` + `UHeadsetPresenceMonitor` + frame-hijacking instructor-view pipeline (`URenderHijackingSubsystem` / `Content/InstructorView/`) git rev `<this commit>` (Phase 7 verified Quest 3)
 >
 > **Maintainer rule:** every time `SignalingSubsystem.h/.cpp`, `TenantRegistry.h/.cpp`,
-> `HeadsetPresenceMonitor.h/.cpp`, the BP integration shape on `BP_VRPawn`,
+> `HeadsetPresenceMonitor.h/.cpp`, `RenderHijackingSubsystem.h/.cpp`,
+> `SceneColorCopyViewExtension.h/.cpp`, the `Content/InstructorView/`
+> asset pack, the BP integration shape on `BP_VRPawn`,
 > the plugin set, the wire protocol docs (`Web_Dashboard/docs/commands.md`,
 > `Web_Dashboard/docs/state-updates.md`), or the per-app module convention
 > (`Web_Dashboard/public/js/apps/README.md`) changes, update the matching
@@ -29,6 +31,8 @@ porting work below is entirely about the Unreal side.
 | `SignalingSubsystem.h/.cpp` | **Drop-in.** Zero dependency on this project's pawn, scene, or Agora. Pure UE + Socket.IO + HTTP. BP-callable surface (as of 2026-06-15): `RefreshToken`, `EmitHeadsetEnd`, `RequestSessionResume`, `EmitStateUpdate(StateName, Data)`, `EmitStateUpdateFromJson(StateName, DataJsonString)`. BP-readable: `AppId`, `AppVersion` (declared in `DefaultGame.ini`, see A.3). `OnHeadsetCommand` delegate now surfaces a full `PayloadJson` string alongside the legacy typed fields, so per-app commands parse in BP via the SocketIO plugin's `Construct Json Object` + `Decode Json` node pair (both under category `SIOJ \| Json`). Wire-protocol contract for both directions: `Web_Dashboard/docs/commands.md` (web → headset) and `Web_Dashboard/docs/state-updates.md` (headset → web). |
 | `TenantRegistry.h/.cpp` | **Drop-in.** Pure UE + HTTP + `FFileHelper`. Owns the first-launch company-code redemption + persistence. **Replaces any prior hardcoded `TenantId` in INI.** Has no UMG dependency — host apps can use their existing in-VR code-input panel (see *BYO code-input UI* section below). |
 | `HeadsetPresenceMonitor.h/.cpp` | **Drop-in.** `UActorComponent` that polls `IXRTrackingSystem::GetHMDWornState()` and fires `OnHeadsetIdleStarted` / `OnHeadsetIdleEnded` BP events for the Agora cost-exposure idle-detection path (Devlog 2026-06-11). Requires `HeadMountedDisplay` in the target module's `Build.cs`. No dependency on Agora or signaling — BP wires the events to whatever leave/rejoin path the host app exposes. |
+| `RenderHijackingSubsystem.h/.cpp` + `SceneColorCopyViewExtension.h/.cpp` | **Drop-in pair (Recipe B).** Copies the already-rendered stereo frame into a runtime `UTextureRenderTarget2D` via a `FSceneViewExtension` — zero second-scene-render cost. Requires `Renderer` in the target module's `Build.cs`. BP starts hijacking via `StartRenderHijacking(1280, 720, InW, InH)` with `InW/InH` from static `GetRecommendedInputResolution()`. See **B.3**. |
+| `Content/InstructorView/` (`BP_InstructorViewLogic`, `M_InstructorView`, `RT_InstructorView`, Quest camera media assets) | **Copy as a unit (Recipe B).** Colleague-authored composite + optional Quest MR overlay. Integrate as a `ChildActorComponent` on the pawn. Per-tick: `GetOutputRenderTarget()` → set `CapturedTexture` on a `M_InstructorView` MID → `DrawMaterialToRenderTarget(RT_InstructorView, MID)`. |
 | `Web_Dashboard/` server | **Already portable.** Runs once, serves any UE app that speaks the wire protocol. |
 | BP integration on `BP_VRPawn` | **Pattern, not asset.** Reproduce the 5 graphs in the target project's pawn or game mode (first-boot init + signaling-ready gate + registration-gate spawn + `OnAgoraChannelChanged` swap handler + `OnJoinChannelSuccess` pump restart) plus the 2 `UHeadsetPresenceMonitor` event handlers if you're porting the idle-detection, plus the per-app state-publish + command-handle graphs from A.4.3 if you're wiring the per-app dashboard UI. Worked example included. |
 | Per-app dashboard UI (`Web_Dashboard/public/js/apps/<AppId>.js`) | **One JS file per VR app.** Optional. Each VR app that wants a custom instructor panel (level picker, per-level controls, in-level metric display) ships an ES module in this directory matching its declared `AppId`. The dashboard's focus view dynamic-imports it based on the live session's `appId`. Sessions without an `appId` (or with no matching module) get the generic fallback panel and still work via the always-present app-agnostic command deck. Module shape + conventions: `Web_Dashboard/public/js/apps/README.md`. |
@@ -40,7 +44,7 @@ porting work below is entirely about the Unreal side.
 | Target project state | Estimated effort | What you actually do |
 |---|---|---|
 | **A. Already streams to Agora over a `t-*` channel** | ~2 hours | Copy 2 C++ files → install 1 plugin → BP wiring on the target's pawn → ini section header rename → cook. |
-| **B. UE 5.5+ mobile VR but no streaming pipeline** | ~1 day | A. + port `AgoraVideoPump.cpp/h` + install Agora plugin + add SceneCapture+RT setup to the target's pawn. |
+| **B. UE 5.5+ mobile VR but no streaming pipeline** | ~1 day | A. + port `AgoraVideoPump.cpp/h` + frame-hijacking C++ + `Content/InstructorView/` assets + install Agora + AndroidMedia plugins + pawn wiring (B.3). |
 | **C. UE 5.3 / 5.4** | ~1-2 days | B. + pin alternate plugin versions (SocketIOClient has per-engine git tags, PICOXR has separate UE 5.3/5.4 downloads) + re-validate. |
 | **D. PC-only / non-VR Unreal** | ~half day | A. minus the PICOXR + Pico config (just Quest desktop sim or actual desktop). |
 
@@ -371,38 +375,105 @@ Copy `VR_Project/Source/VR_Project/AgoraVideoPump.cpp` and `.h` into
 `<Target>/Source/<TargetModule>/`. Update the API macro if needed
 (see A.2).
 
-The pump is a `UObject` you spawn once and tell to pump a specific
-`UTextureRenderTarget2D` to Agora. The pattern in `VRPawn`'s BP after
-`Join Channel`:
+The pump is a `UActorComponent` on the pawn. After `Join Channel` /
+`OnJoinChannelSuccess`, call `StartVideoPump` (or
+`RestartForNewChannel` on mid-session channel swaps per A.4.1).
 
+**Critical pin:** `SourceRT` MUST reference the composite output
+`/Game/InstructorView/RT_InstructorView` (1280×720, `RTF_RGBA8_SRGB`),
+NOT a SceneCapture target. Pumping an inactive capture RT produces a
+uniform clear-color stream (black) even when Agora join succeeds.
+
+### B.3. Frame-hijacking instructor-view pipeline (current default)
+
+This is the production path as of Phase 7 (verified Quest 3,
+2026-06-18). It replaces the legacy SceneCapture re-render described
+in B.3.1.
+
+**C++ to copy** into `<Target>/Source/<TargetModule>/`:
+
+- `RenderHijackingSubsystem.h/.cpp` — rename `VR_PROJECT_API` if needed.
+- `SceneColorCopyViewExtension.h/.cpp` — no API macro.
+
+Add `Renderer` to `PrivateDependencyModuleNames` and
+`PrivateIncludePathModuleNames` in the target `Build.cs` (needed for
+`FPostProcessMaterialInputs` / `FScreenPassTexture`).
+
+**Plugins to enable** in `<Target>.uproject`:
+
+- `AndroidMedia` (Android-only) — Quest MR camera via `vidcap://rear`.
+- Agora plugin (Recipe B.1).
+
+**Content to copy** verbatim:
+
+- `VR_Project/Content/InstructorView/` → `<Target>/Content/InstructorView/`
+
+**Android permissions** in `DefaultEngine.ini`:
+
+```ini
++ExtraPermissions=android.permission.CAMERA
 ```
-[Construct UAgoraVideoPump]
-    → InstructorRT (UTextureRenderTarget2D ref)
-    → 1280, 720    (width, height)
-    → 30.0         (target Hz)
-[Start Video Pump]
-```
 
-### B.3. Set up SceneCapture → RT in the target's pawn/scene
+**Pawn wiring (`BP_VRPawn` pattern):**
 
-- Add a `USceneCaptureComponent2D` to the pawn (or wherever you want
-  the trainee POV captured from — usually the camera).
-- Create a `UTextureRenderTarget2D` asset, set format to **`RTF_RGBA8_SRGB`**
-  (this is non-negotiable — `RTF_RGBA8` produces 2.4× too-dark output in
-  the browser because of a linear/sRGB mismatch on the readback path;
-  full diagnosis in Devlog 2026-06-03 "Phase 3 polish (perf + color)
-  consolidated", section B).
-- Wire the SceneCapture's `TextureTarget` to the RT.
+1. Add `BP_InstructorViewLogic` as a **`ChildActorComponent`** (the
+   colleague BP parents to `Actor`, not `ActorComponent` — do not try
+   to re-parent it).
+2. `BeginPlay` on the child: `Get Game Instance Subsystem
+   (URenderHijackingSubsystem)` → `Start Render Hijacking` with
+   Width=1280, Height=720, Input Width/Height Override wired from
+   `Get Recommended Input Resolution` (never hardcode Quest dims — breaks
+   Pico's right-eye crop offset).
+3. **Per tick** on the child: `Get Output Render Target` →
+   `Set Texture Parameter Value` (`CapturedTexture` on the
+   `M_InstructorView` MID) → `Draw Material to Render Target`
+   with destination **`RT_InstructorView`** (pin must be non-null).
+4. On the pawn: `UAgoraVideoPump` → `Source RT = RT_InstructorView`.
+5. `On Headset Command` → `set_mr_mode` → cast to child →
+   `Start Camera` / `Stop Camera` (Quest MR; Pico no-ops cleanly).
+6. **Disable** any legacy `SceneCaptureComponent2D` on the pawn
+   (uncheck Auto Activate, Capture Every Frame, Capture On Movement).
+   Leave the component in place for revert during bring-up.
+
+**Format rule (non-negotiable):** `RT_InstructorView` must be
+`RTF_RGBA8_SRGB`. Linear `RTF_RGBA8` readback produces too-dark
+browser video (same diagnosis as Devlog 2026-06-03 SceneCapture color
+fix).
+
+### B.3.1. Legacy SceneCapture → RT fallback (deprecated)
+
+Use only when frame hijacking is unavailable (e.g. non-stereo desktop
+capture experiments). Not the production mobile-VR path.
+
+- Add a `USceneCaptureComponent2D` to the pawn camera.
+- Create `RT_InstructorStream` at 1280×720, format **`RTF_RGBA8_SRGB`**.
+- Wire SceneCapture `TextureTarget` to the RT.
 - On a `0.0333` s timer, call `CaptureScene()`. Don't go faster — 30 Hz
   is the spec'd cap.
+- Point `UAgoraVideoPump::SourceRT` at that RT.
 
 ### B.4. Verify
 
 In addition to the Recipe A logcat checks, look for:
 
 ```
-LogAgoraVideoPump: Display: StartVideoPump: pumping 1280x720 @ 30.0 Hz (async readback)
+LogTemp: Warning: RenderHijacking: Started. Output=1280x720.
+LogTemp: Warning: SceneColorCapture: Right Eye copy OK. ... ArraySize=2 ...
+LogAgoraVideoPump: Display: StartVideoPump: pumping 1280x720 @ 30.0 Hz ...
 ```
+
+On Quest, `ArraySize=2` confirms stereo hijack; `ArraySize=1` in VR
+Preview on PC is expected noise (desktop tonemap path still works).
+
+**Black-stream triage (Agora join OK but video pane is solid black):**
+
+1. Preview `RT_InstructorView` in the editor with *Update Render
+   Targets in Real Time* — if it stays the RT's clear color, the
+   composite step is not writing (`DrawMaterialToRenderTarget` null
+   destination pin is the most common cause).
+2. Confirm `UAgoraVideoPump::SourceRT` is `RT_InstructorView`, not the
+   legacy inactive SceneCapture RT.
+3. Confirm legacy SceneCapture is disabled.
 
 Open the dashboard's focus view of the headset's tile — the video pane
 should show the trainee POV with correct exposure (not 2× too dark).
@@ -449,6 +520,9 @@ since the target is not deploying to Meta hardware. Everything else
 | `Source/<Module>/TenantRegistry.h/.cpp` | New files (copied from this project). Update `VR_PROJECT_API` → `<MODULE>_API` if needed. |
 | `Source/<Module>/HeadsetPresenceMonitor.h/.cpp` | New files, **recommended for production** (Agora cost mitigation per A.4.2). Skip for desktop-only or non-billing-sensitive deployments. Update API macro if needed. |
 | `Source/<Module>/AgoraVideoPump.h/.cpp` | New files, **only if Recipe B**. |
+| `Source/<Module>/RenderHijackingSubsystem.h/.cpp` | New files, **only if Recipe B** (frame hijack). |
+| `Source/<Module>/SceneColorCopyViewExtension.h/.cpp` | New files, **only if Recipe B** (frame hijack). |
+| `Content/InstructorView/` | Copy entire folder, **only if Recipe B**. |
 | `Config/DefaultGame.ini` | New `[/Script/<Module>.SignalingSubsystem]` and `[/Script/<Module>.TenantRegistry]` blocks. |
 | `Config/DefaultEngine.ini` | Update `[/Script/AndroidRuntimeSettings.AndroidRuntimeSettings]` + add `[/Script/PICOXRHMD.PICOXRSettings]` (if VR). |
 | `<Pawn or game mode>.uasset` | The BP graph edits — `OnSignalingReady` event, `BeginPlay` gate, three literal-to-variable-read pin replacements, plus showing the registration panel if `!IsRegistered()`. |
@@ -581,6 +655,7 @@ Append a row when this guide's prescriptions change (new plugin, BP shape change
 
 | Date | Commit | What changed |
 |---|---|---|
+| 2026-06-18 | `<this commit>` | Phase 7 frame-hijacking instructor-view pipeline verified on Quest 3. Recipe B rewritten: **B.3** is now the hijack + `Content/InstructorView/` composite path; legacy SceneCapture moved to **B.3.1 (deprecated)**. TL;DR table grew rows for `RenderHijackingSubsystem` / `SceneColorCopyViewExtension` + `Content/InstructorView/`. Reference table + B.4 verification log lines + black-stream triage checklist added. `AgoraVideoPump::SourceRT` must point at `RT_InstructorView`. |
 | 2026-06-15 (follow-up) | `<this commit>` | End-to-end PIE verification of per-app control plane caught two issues, both now fixed and documented. (1) **Gotcha #13 added** — the SocketIOClient plugin's `BindEventToFunction` inspects only the first UFUNCTION parameter to decide arg-packing; a leading `FString EventName` param with a trailing `USIOJsonValue*` silently miscalls and crashes in `AsObject()` on first inbound event. Fix: drop the `FString` and bind one UFUNCTION per event. CRITICAL warning comments now live on the .h declaration + .cpp body of `HandleHeadsetCommandEvent`. (2) **New BP overload `EmitStateUpdateFromJson(StateName, DataJsonString)`** — the original `USIOJsonObject*` variant is verbose for array-of-objects payloads (e.g. `available_levels`); the JSON-string variant lets BPs ship the entire payload as a single literal or `Format Text` result. A.4.3 now documents both with "pick whichever is simpler for your data shape" guidance. TL;DR row for `SignalingSubsystem.h/.cpp` lists both variants. Also corrected an incorrect node name reference: parsing `Command.PayloadJson` uses `Construct Json Object` + `Decode Json` (two nodes, both under `SIOJ \| Json`), NOT the fictional "Construct Json Object From String" node. |
 | 2026-06-15 | `<this commit>` | Per-app interactive control plane landed. `USignalingSubsystem` BP surface grew `EmitStateUpdate(StateName, Data)` (BP-callable), `AppId` + `AppVersion` (BP-readable, loaded from `DefaultGame.ini`), and `FSignalingCommand::PayloadJson` (full JSON of any inbound command, so per-app commands parse cleanly in BP without new C++ struct fields per command shape). New TL;DR row for the per-app dashboard module convention (`Web_Dashboard/public/js/apps/<AppId>.js`). New sub-recipe **A.4.3** documents the wiring for any target project that wants instructor-side UI beyond the four app-agnostic commands. New cross-reference to the wire-protocol docs (`Web_Dashboard/docs/commands.md` for web → headset, `Web_Dashboard/docs/state-updates.md` for headset → web). INI snippet in A.3 now includes `AppId` + `AppVersion`. The full control plane is **opt-in**: target projects that leave `AppId` blank still stream video + accept legacy commands, they just don't get app-specific dashboard UI. |
 | 2026-06-11 | `<this commit>` | Phase 1 Agora cost-exposure shipped (Devlog 2026-06-11). New `HeadsetPresenceMonitor.h/.cpp` added to TL;DR portability table + A.2 copy step + A.4.2 BP wiring sub-recipe + reference-table row. `Build.cs` snippet now mentions the `HeadMountedDisplay` dep needed for it. SignalingSubsystem TL;DR row updated to list the new BP-callable surface (`EmitHeadsetEnd` made public, new `RequestSessionResume`). The component is presented as "recommended for production, skippable for desktop-only" — host apps with their own idle-detection can leave it out. |

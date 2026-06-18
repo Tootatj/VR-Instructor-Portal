@@ -923,6 +923,97 @@ Both paths route through new `EnterIdle(Reason)` / `ExitIdle(Reason)` helpers th
 
 Verified clean Win64 compile + link via UBT after the rewrite. On-device retest pending the same cook + sideload cycle as before. Devlog 2026-06-11 entry above amended to reflect the corrected design; the original "BP timer on BP_VRPawn polls every 30 s" wording from the 2026-06-08 audit entry stays as-is for historical accuracy (the corrected diagnosis is in *this* entry).
 
+### 2026-06-15 (afternoon) — Phase 7 instructor-view rebuild: IN PROGRESS, mid-integration, NOT committed
+
+**Status: paused at end-of-day, all work uncommitted on local working tree. User picks up tomorrow on a different PC via external drive (same repo, .git intact, in-flight changes travel with it).** Last committed rev is `c39c161` (this morning's per-app control-plane milestone). Everything below is on top of that, none of it pushed.
+
+**What this is.** Replacing the Phase 1/2 `SceneCaptureComponent2D` pipeline (which re-renders the entire scene a second time at 30 Hz to feed Agora) with a "frame hijacking" approach contributed by an external collaborator. New pipeline copies the *already-rendered* stereo frame from one eye into a `UTextureRenderTarget2D` via a `FSceneViewExtension` hook in `PostRenderView_RenderThread` — zero re-render cost. Plus a Mixed-Reality overlay path that composites Quest passthrough camera (via AndroidMedia `vidcap://rear`) over the hijacked frame in a material using HLSL FOV-warping. Pico MR no-ops cleanly (PICOXR uses a different seethrough API not in scope for this pass).
+
+**Locked design decisions (made + confirmed earlier today via interactive AskQuestion):**
+- Module placement: C++ in `VR_Project/Source/VR_Project/` + content in new `Content/InstructorView/` folder (NOT a separate plugin — defer plugin extraction to the future `OneBonsaiSignaling.uplugin` pass).
+- Pico MR: Quest-only for now; Pico VR-only with MR no-op. Render hijack itself is cross-vendor.
+- MR trigger: new **app-agnostic** instructor command `set_mr_mode` with `{enabled: bool}` payload — slots into the per-app control plane shipped this morning.
+- Stream resolution: keep 1280×720 (override the colleague's 2016×1760 default at the `StartRenderHijacking` call site).
+- Old SceneCapture path: disabled in `BP_VRPawn` but NOT deleted, for one-click revert during device testing.
+
+**Done by agent (uncommitted but on disk):**
+- C++ files dropped into `VR_Project/Source/VR_Project/`:
+  - `RenderHijackingSubsystem.h/.cpp` — colleague's code with `PICOOOO_API` → `VR_PROJECT_API` rename + new static BP helper `GetRecommendedInputResolution()` that returns `(1500,1850)` for PICOXR runtime and `(1720,1760)` for OpenXR/Quest (detected via `GEngine->XRSystem->GetSystemName().Contains("PicoXR")` — more robust than the colleague's suggested `GetEnabledPlugins().Contains("PicoXR")` which would mis-detect on our universal cook that links both plugins simultaneously).
+  - `SceneColorCopyViewExtension.h/.cpp` — colleague's code verbatim (no API tag needed; non-UCLASS).
+- `VR_Project.Build.cs` — added `Renderer` module to private deps + `PrivateIncludePathModuleNames` (needed for `FPostProcessMaterialInputs` / `FScreenPassTexture`; may need iteration on first compile).
+- `VR_Project.uproject` — enabled `AndroidMedia` plugin (Android-only). **Still pending: `AndroidPermission` plugin** — surfaced during BP wiring as missing for `Check Permission` node; verify it's enabled before tomorrow's first cook (Edit → Plugins → search "Android Permission" → enable if off).
+- `DefaultEngine.ini` — `+ExtraPermissions=android.permission.CAMERA` (Quest-only path; Pico ships the perm but never requests it). Also added a `[CoreRedirects]` block to remap `/Script/PICOOOO.RenderHijackingSubsystem` → `/Script/VR_Project.RenderHijackingSubsystem` so the colleague's BP can resolve our class. **In practice the user opted for manual node-swap fixup instead — the redirect is still in place as a belt-and-braces for any other PICOOOO refs that surface.**
+- `Web_Dashboard/src/commands.js` — `set_mr_mode` validator added to global `COMMAND_VALIDATORS`. App-agnostic in protocol, opt-in in implementation.
+- `Web_Dashboard/docs/commands.md` — new §5 documenting `set_mr_mode` + Pico no-op caveat.
+- `.cursorrules` §5.2 — `set_mr_mode` documented with opt-in qualifier.
+- `Web_Dashboard/public/index.html` — Enable MR / Disable MR buttons in the focus-view command deck.
+- `Web_Dashboard/public/js/grid.js` — `set_mr_mode` branch in `wireCommandDeck` dispatcher with string→boolean coercion.
+- Content: 6 `.uasset` files copied to `VR_Project/Content/InstructorView/` (`BP_InstructorViewLogic` 171 KB, `M_InstructorView` 24 KB, `MP_QuestCam` 1.4 KB, `MP_QuestCam_Video` 2.9 KB, `MS_QuestCamera` 1.6 KB, `RT_InstructorView` 4.5 KB).
+
+**Done by user (uncommitted but on disk):**
+- `BP_InstructorViewLogic` — colleague's BP loaded with broken class refs (their module was `PICOOOO`, the BP's `Get Subsystem`/`Start Render Hijacking`/`Get Output Render Target` nodes all degraded to "self" because the class path didn't resolve). User opted for manual node-swap fixup rather than relying on the CoreRedirect: deleted the broken nodes, re-added fresh `Get Game Instance Subsystem (URenderHijackingSubsystem)` → `Start Render Hijacking` and `Get Output Render Target` nodes. **Verify when picking up tomorrow:** the `Start Render Hijacking` node has Width=1280, Height=720, and Input Width/Height Override wired from `Get Recommended Input Resolution` (NOT hardcoded Quest values — hardcoded values break Pico). Also worth opening `BP_InstructorViewLogic` and confirming Compile is green + the file is saved. As of this snapshot, `git status` does NOT list `BP_InstructorViewLogic.uasset` as modified, which means either UE auto-saved it back to its on-disk content (unlikely after a meaningful edit) OR the user hasn't pressed Save yet — first thing to verify tomorrow.
+- `BP_InstructorViewLogic` — created two new Custom Events: `StartCamera` and `StopCamera` (colleague's .md listed them as recommendations, not pre-built). Implementation follows the .md spec: `Check Permission("android.permission.CAMERA")` → on success → `Open Source` / `Close` on `MediaPlayer` + `Set Scalar Parameter Value` on `DynamicMaterial` (`IsUsingMR` = 1 / 0).
+- `BP_VRPawn` — modified (`git status` shows the .uasset is dirty). At minimum: `BP_InstructorViewLogic` added to it as a **ChildActorComponent** (colleague's BP turned out to be parented to `Actor`, not `ActorComponent` despite the .md saying ActorComponent; using it as a ChildActorComponent is the right call here — re-parenting would have risked breaking the colleague's graph). Phase 3 wiring was IN PROGRESS at end of day — `set_mr_mode` handler wiring via `Get Child Actor` → `Cast To BP_InstructorViewLogic` → promote to local var → `Start Camera`/`Stop Camera` per the call chain documented today. **Almost certainly not yet wired:** `UAgoraVideoPump::SourceRT` re-pin from `RT_InstructorStream` → `RT_InstructorView`, and the SceneCapture disable (3 unchecks: Auto Activate, Capture Every Frame, Capture On Movement).
+
+**Tomorrow's pick-up checklist (in order):**
+
+1. **Verify the drive came across with the .git folder intact.** `cd` to project root, run `git status` — should match the full uncommitted list above (modulo whatever BPs the user saves at end-of-day). If `.git` is missing, the working tree is fine but commit/push capability is gone — recover by re-cloning into a sibling dir + copying over the working-tree changes.
+2. **Verify all BPs are saved.** Open `BP_InstructorViewLogic` first — confirm it compiles + verify save status. Then `BP_VRPawn` — same. Anything dirty in the editor that wasn't on-disk at unplug time is gone.
+3. **Verify `AndroidPermission` plugin is enabled** in `VR_Project.uproject` Plugins list. If not, enable it (Edit → Plugins, search "Android Permission") OR ping me to add it to the .uproject the same way I added AndroidMedia. Without it, `Check Permission` BP nodes won't resolve and `StartCamera` will silently fail at runtime.
+4. **Finish `BP_VRPawn` Phase 3 wiring** (whatever's left of these three):
+   - `UAgoraVideoPump` component → Details → Source RT dropdown from `RT_InstructorStream` to `RT_InstructorView`.
+   - `SceneCaptureComponent2D` → uncheck Auto Activate + Capture Every Frame + Capture On Movement (DO NOT delete — keeps revert path).
+   - `On Headset Command` graph → finish the `set_mr_mode` cast chain if not done.
+5. **Compile + Save BP_VRPawn.** Confirm green.
+6. **Phase 4: Quest device test.** `.\Tools\Cook-VRApp.ps1 -Device quest`, install, grant camera perm on first launch, register, expand tile, verify VR stream renders through new path, click Enable MR overlay, verify passthrough composite appears.
+7. **Phase 5: Pico device test.** `.\Tools\Cook-VRApp.ps1 -Device pico`, register, verify VR stream works (frame hijack is platform-agnostic), verify Enable MR button no-ops cleanly (no crash; expected behavior since `vidcap://rear` will fail to open).
+8. **Phase 6: cleanup.** Only after both devices green: delete SceneCaptureComponent2D from BP_VRPawn, delete `RT_InstructorStream.uasset` + `M_RTStreamDebug.uasset`, then ping me to update `.cursorrules §1.3` + `HowToPort.md` + write the Devlog "(verified)" follow-up entry + commit + push.
+
+**Known risk areas to watch tomorrow:**
+- First C++ compile may fail on `Renderer` module include resolution — UE 5.5 sometimes wants additional include-path massaging beyond `PrivateIncludePathModuleNames.Add`. If it fails, paste the build log; the fix is usually one more line in Build.cs.
+- The colleague's right-eye corner-flicker fix in `SceneColorCopyViewExtension.cpp` line 365 (`CroppedSourcePosition.X += SourceDesc.Extent.X - InputWidthOverride`) requires non-zero InputWidthOverride — that's exactly why `GetRecommendedInputResolution()` defaults to Quest dims on unknown runtimes (passing 0 would shift the crop entirely off the texture).
+- ChildActorComponent has a "child not yet spawned" race during BeginPlay — `Get Child Actor` can return None. Cast Failed pin handles it gracefully but worth knowing if any "early" wiring is added later (the `set_mr_mode` handler isn't early — instructor commands arrive long after pawn spawn).
+
+**Revert path if something goes catastrophically wrong:** `git checkout -- .` + `rm -rf VR_Project/Content/InstructorView/` + `rm VR_Project/Source/VR_Project/RenderHijack* SceneColorCopy*` returns the working tree to the `c39c161` (per-app control plane) baseline. Last-committed state is fully functional cross-vendor.
+
+### 2026-06-18 (verified) — Phase 7 instructor-view rebuild: Quest end-to-end pass
+
+Closed the Phase 7 integration loop on **Meta Quest 3** after porting the colleague's frame-hijacking stack and finishing the BP wiring on this repo. Instructor dashboard receives a live 1280×720 trainee POV over Agora; `set_mr_mode` toggles the Quest passthrough composite path.
+
+**Verified pipeline (Quest 3, real hardware):**
+
+```
+Stereo HMD frame → FSceneColorCopyViewExtension (right-eye crop → 1280×720 internal RT)
+                → BP_InstructorViewLogic per-tick composite (M_InstructorView + DrawMaterialToRenderTarget)
+                → RT_InstructorView (RTF_RGBA8_SRGB)
+                → UAgoraVideoPump::SourceRT
+                → Agora → web dashboard focus view
+```
+
+Logcat signatures on a healthy session: `RenderHijacking: Started. Output=1280x720`, `SceneColorCapture: Right Eye copy OK ... ArraySize=2`, `StartVideoPump: pumping 1280x720 @ 30.0 Hz`, `Agora PEER JOINED`.
+
+**Integration fixes that were required beyond dropping in the colleague's assets (not bugs in their BP logic — wiring + import context):**
+
+1. **`PICOOOO` → `VR_Project` class remap** — colleague's subsystem nodes degraded to `self` on import; user re-added `Get Game Instance Subsystem (URenderHijackingSubsystem)` nodes manually. `[CoreRedirects]` block kept in `DefaultEngine.ini` as belt-and-braces.
+2. **`UAgoraVideoPump::SourceRT`** — re-pinned from legacy `RT_InstructorStream` to `/Game/InstructorView/RT_InstructorView`. With SceneCapture disabled, pumping the old RT produced a uniform black stream (the RT's clear color).
+3. **`DrawMaterialToRenderTarget` destination** — the `RT_InstructorView` pin must reference the asset explicitly; a null pin is a silent no-op (Output Log warning: `TextureRenderTarget must be non-null`). Black web video with a healthy hijack + Agora join is the tell.
+4. **`BP_InstructorViewLogic` as `ChildActorComponent` on `BP_VRPawn`** — colleague's BP parents to `Actor`, not `ActorComponent`; ChildActor is the correct integration shape here.
+5. **SceneCapture path disabled, not deleted** — `SceneCaptureStream` left in place but inactive for one-click revert during bring-up.
+
+**Dashboard side (shipped with this milestone):** `set_mr_mode` validator + focus-view Enable MR / Disable MR buttons; documented in `commands.md` §5.
+
+**C++ additions beyond colleague drop-in:** `GetRecommendedInputResolution()` static helper (Quest 1720×1760 / Pico 1500×1850 via active `IXRTrackingSystem` name, not enabled-plugin probe); `Renderer` module dep in `Build.cs`; `AgoraVideoPump` diagnostic logs (`SourceRT` path + first-frame BGRA sample on pump start).
+
+**Still open (not blocking Quest verification):**
+
+- Pico 4 Enterprise stream smoke on the hijack path (expected to work — extension is vendor-agnostic; MR toggle expected to no-op).
+- Phase 6 cleanup: delete disabled `SceneCaptureComponent2D`, `RT_InstructorStream`, `M_RTStreamDebug` once Pico is green.
+- `AndroidPermission` plugin enablement in `.uproject` if `Check Permission` nodes need to resolve on a clean clone (Quest MR camera path).
+
+**Files in this milestone:** `RenderHijackingSubsystem.*`, `SceneColorCopyViewExtension.*`, `Content/InstructorView/*`, `BP_VRPawn` wiring, `AgoraVideoPump` diagnostics, `DefaultEngine.ini` (CAMERA perm + CoreRedirects), dashboard `set_mr_mode` plumbing, `.cursorrules` / `HowToPort.md` video-pipeline updates.
+
+---
+
 ### 2026-06-15 (verified + two fixes shipped along the way) — End-to-end PIE pass: load_level → state transition → UI re-render
 
 Closed out the per-app control plane work with a working end-to-end test from the editor: instructor expands a VRFT tile, sees the level picker rendered from `available_levels` published by the headset, clicks "Level 02", VR app loads the requested map, headset publishes the new state, dashboard transitions from the hub view to the level-active view with a return-to-hub button. Round-trip confirmed both directions, with the headset as the source of truth for the level catalog (so adding maps in the VR app needs zero dashboard changes — per the design intent).

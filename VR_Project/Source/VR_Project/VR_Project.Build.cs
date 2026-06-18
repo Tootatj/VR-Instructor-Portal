@@ -14,7 +14,14 @@ public class VR_Project : ModuleRules
 		// (not exposed in the plugin's Blueprint surface), so UAgoraVideoPump links against the
 		// plugin's public C++ headers. RenderCore + RHI are required for the render-thread RT
 		// readback that feeds each pushed frame.
-		PrivateDependencyModuleNames.AddRange(new string[] { "AgoraPlugin", "RenderCore", "RHI" });
+		//
+		// Renderer: required by FSceneColorCopyViewExtension (Phase 7 instructor-view rebuild,
+		// 2026-06-15) for FPostProcessMaterialInputs / FScreenPassTexture / FScreenPassRenderTarget.
+		// Renderer is technically a private engine module — UE 5.5 supports adding it to a game
+		// module's PrivateDependencyModuleNames as long as we also expose its include search path
+		// via PrivateIncludePathModuleNames below.
+		PrivateDependencyModuleNames.AddRange(new string[] { "AgoraPlugin", "RenderCore", "RHI", "Renderer" });
+		PrivateIncludePathModuleNames.Add("Renderer");
 
 		// SocketIOClient (getnamo) + its JSON helper module: USignalingSubsystem speaks the
 		// dashboard's Socket.IO protocol (headset:register, headset:command, etc.) and uses

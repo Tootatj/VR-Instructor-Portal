@@ -67,6 +67,35 @@ Every command is a JSON object with at minimum a string `command` field.
 
 No additional fields. The headset teleports the player back to the level's `PlayerStart`.
 
+### 5. Set Mixed-Reality Mode
+
+```json
+{ "command": "set_mr_mode", "enabled": true }
+```
+
+| Field | Type | Required | Notes |
+|---|---|---|---|
+| `command` | string | yes | Must be `"set_mr_mode"` |
+| `enabled` | boolean | yes | `true` = composite the live device camera over the VR view (Quest passthrough); `false` = pure VR. |
+
+App-agnostic in *protocol* but **opt-in in implementation**. A VR app without
+MR / passthrough capability is expected to ignore the command (per the §5.2
+"unknown commands" rule). On Quest, the headset enables the device's
+front-facing camera via `MediaSource("vidcap://rear")` and composites in
+`M_InstructorView`. **On Pico the command currently no-ops** — `vidcap://`
+is a Meta-specific URL scheme; PICOXR exposes seethrough through a different
+API. A future Pico-side implementation would toggle the same `IsUsingMR`
+material scalar through PICOXR's `EnableVideoSeeThrough`.
+
+After applying the toggle, the headset SHOULD publish a state-update with
+`data.mr_enabled: true|false` so the dashboard can confirm the change took
+effect (Quest will, since the BP graph wires the response; Pico will not
+until the seethrough path is implemented). Dashboards should not assume
+the command succeeded — they should observe the next state-update.
+
+Added: 2026-06-15 (Phase 7 instructor-view rebuild — frame hijacking +
+MR overlay landed alongside this command).
+
 ## App-specific commands
 
 The four commands above are **app-agnostic** — any VR app should respond to

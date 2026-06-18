@@ -379,6 +379,16 @@ Expect the same boot lines as Recipe A.6.
 Same as Recipe A steps 8-10. The deploy mechanism differs but
 everything downstream is identical.
 
+**Instructor video stream (Phase 7 — frame hijacking, post-2026-06-18):**
+after a Quest cook + register + instructor join, confirm the focus-view
+video pane shows live trainee POV (not a solid black tile). Healthy
+`adb logcat` signatures: `RenderHijacking: Started`, `SceneColorCapture:
+Right Eye copy OK ... ArraySize=2`, `StartVideoPump: pumping 1280x720`.
+Black video with a successful Agora join almost always means the
+`RT_InstructorView` composite is not writing or `AgoraVideoPump::SourceRT`
+still points at the disabled legacy SceneCapture RT — see `HowToPort.md`
+B.4 black-stream triage.
+
 ### B.9. Update workflow
 
 When new code lands on `main`:

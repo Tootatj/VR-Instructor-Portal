@@ -106,8 +106,11 @@ void UAgoraVideoPump::StartVideoPump()
     }
 
     UE_LOG(LogAgoraVideoPump, Display,
-        TEXT("StartVideoPump: pumping %dx%d @ %.1f Hz (async readback)"),
-        SourceRT->SizeX, SourceRT->SizeY, 1.0f / PumpIntervalSeconds);
+        TEXT("StartVideoPump: pumping %dx%d @ %.1f Hz from %s (format=%d)"),
+        SourceRT->SizeX, SourceRT->SizeY, 1.0f / PumpIntervalSeconds,
+        *SourceRT->GetPathName(), static_cast<int32>(SourceRT->RenderTargetFormat));
+
+    bLoggedFirstFrameSample = false;
 }
 
 void UAgoraVideoPump::StopVideoPump()
@@ -213,6 +216,16 @@ void UAgoraVideoPump::PumpFrame()
             Frame.stride    = RowPitchInPixels;
             Frame.height    = H;
             Frame.timestamp = PendingFrameTimestampMs;
+
+            if (!bLoggedFirstFrameSample)
+            {
+                const FColor Sample = static_cast<const FColor*>(Data)[0];
+                UE_LOG(LogAgoraVideoPump, Display,
+                    TEXT("First pumped frame: top-left BGRA=(%d,%d,%d,%d) stride=%d height=%d"),
+                    Sample.B, Sample.G, Sample.R, Sample.A,
+                    RowPitchInPixels, BufferHeight);
+                bLoggedFirstFrameSample = true;
+            }
 
             auto* MediaEngine = static_cast<agora::media::IMediaEngine*>(CachedMediaEngine);
             MediaEngine->pushVideoFrame(&Frame);

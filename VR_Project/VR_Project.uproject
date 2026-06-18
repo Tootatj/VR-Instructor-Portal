@@ -53,6 +53,13 @@
 				"Win64",
 				"Android"
 			]
+		},
+		{
+			"Name": "AndroidMedia",
+			"Enabled": true,
+			"SupportedTargetPlatforms": [
+				"Android"
+			]
 		}
 	],
 	"TargetPlatforms": [

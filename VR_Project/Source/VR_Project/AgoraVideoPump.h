@@ -137,4 +137,7 @@ private:
 
     /** True iff setExternalVideoSource(true,...) has been called and not yet undone. */
     bool bExternalSourceEnabled = false;
+
+    /** One-shot debug sample of the first harvested frame (see PumpFrame). */
+    bool bLoggedFirstFrameSample = false;
 };

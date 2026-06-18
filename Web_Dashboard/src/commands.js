@@ -41,6 +41,18 @@ const COMMAND_VALIDATORS = {
       : 'trigger_event.event_type must be a non-empty string',
 
   reset_user_position: () => null,
+
+  // Phase 7 instructor-view rebuild (2026-06-15). Tells a VR app with
+  // Mixed-Reality / passthrough-camera capability to composite its
+  // current view with the device camera (true) or stop compositing and
+  // return to pure VR (false). App-agnostic in *protocol* but opt-in
+  // in *implementation*: a pure-VR app without MR support is expected
+  // to no-op cleanly (per .cursorrules §5.2 — "Unknown commands MUST
+  // be ignored by the headset and logged by the server"). The headset
+  // BP signals success/failure via a subsequent state-update with
+  // data.mr_enabled so the dashboard can confirm the toggle landed.
+  set_mr_mode: (p) =>
+    typeof p.enabled === 'boolean' ? null : 'set_mr_mode.enabled must be boolean',
 };
 
 /**

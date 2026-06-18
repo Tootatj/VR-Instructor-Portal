@@ -611,6 +611,11 @@ function wireCommandDeck(socket) {
         const v = document.getElementById('event-type-input').value.trim();
         if (!v) { logCommand(`trigger_event: event type required`, 'error'); return; }
         payload.event_type = v;
+      } else if (command === 'set_mr_mode') {
+        // Phase 7 instructor-view rebuild (2026-06-15). data-value is "true"/"false"
+        // as a string per HTML data-attribute conventions; coerce to actual boolean
+        // because the server validator (commands.js) requires typeof === 'boolean'.
+        payload.enabled = btn.dataset.value === 'true';
       }
 
       const ack = await emitWithAck(socket, 'instructor:command', payload);
