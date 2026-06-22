@@ -87,14 +87,24 @@ If UE refuses to launch with a "missing modules" error, Visual Studio's
 
 ## Build and deploy to a headset
 
-**Use the per-device cook wrapper as the entry point** (handles the per-vendor
-`[HMDPluginPriority]` mutation + APK renaming automatically):
+**Use the per-device cook wrapper as the entry point.** Same pipeline for both
+vendors — only the `-Device` flag (and the temporary INI mutation inside the
+script) differs:
 
 ```powershell
+# From repository root — if execution policy blocks unsigned scripts, prefix:
+#   powershell -ExecutionPolicy Bypass -File .\Tools\Cook-VRApp.ps1 ...
+
 .\Tools\Cook-VRApp.ps1 -Device quest         # cook + deploy to Quest 3
 .\Tools\Cook-VRApp.ps1 -Device pico          # cook + deploy to Pico 4 Enterprise
-.\Tools\Cook-VRApp.ps1                       # auto-detect from `adb devices`
+.\Tools\Cook-VRApp.ps1                       # auto-detect (one headset on ADB)
+.\Tools\Cook-VRApp.ps1 -Device quest -NoDeploy   # APK only, no install
 ```
+
+**Output APKs** (both can coexist on disk after separate cooks):
+
+- `VR_Project/Binaries/Android/VR_Project-Quest-arm64.apk`
+- `VR_Project/Binaries/Android/VR_Project-Pico-arm64.apk`
 
 See [`.cursorrules` §8](.cursorrules) for the full pipeline (pre-flight
 requirements, the underlying verbatim UAT command, flag reference, build
@@ -105,12 +115,15 @@ follow-up entry for the rationale.
 
 Pre-flight (verify *before* invoking the wrapper):
 
-1. Headset connected via a USB-C **data** cable (charge-only cables will not enumerate).
-2. Developer Mode toggled on in the device's mobile companion app.
-3. USB debugging authorized on the headset screen.
-4. `adb devices` lists the headset with status `device` (not `unauthorized`, not `offline`).
-5. PowerShell execution policy allows running unsigned local scripts —
-   one-time setup: `Set-ExecutionPolicy -Scope CurrentUser RemoteSigned`.
+1. **Close Unreal Editor** — Live Coding blocks Android compiles if the editor is open.
+2. Headset connected via a USB-C **data** cable (charge-only cables will not enumerate).
+3. Developer Mode toggled on in the device's mobile companion app.
+4. USB debugging authorized on the headset screen.
+5. `adb devices` lists the headset with status `device` (not `unauthorized`, not `offline`).
+6. `VR_Project/Config/DefaultEngine.ini` has **no uncommitted git changes** — the script temporarily mutates `[HMDPluginPriority]` and refuses to run if the file is already dirty.
+7. PowerShell execution policy allows running unsigned local scripts —
+   one-time setup: `Set-ExecutionPolicy -Scope CurrentUser RemoteSigned`,
+   or use `-ExecutionPolicy Bypass` per invocation (see examples above).
 
 ## Web Dashboard
 
@@ -122,8 +135,17 @@ a code-based login flow, and a canvas-published faker tool for testing
 the grid without N physical headsets.
 
 For local development setup, see [`Web_Dashboard/README.md`](Web_Dashboard/README.md)
-— install Node, copy `.env.example`, `npm run dev`, open `http://localhost:3000`,
-and run the 2-minute end-to-end smoke test documented there.
+— install Node, copy `.env.example`, then start the server:
+
+```powershell
+# From Web_Dashboard/
+npm run dev          # auto-restart on file changes
+# or, if PowerShell blocks npm scripts:
+node server.js
+```
+
+Open `http://localhost:3000` and run the 2-minute end-to-end smoke test
+documented in the dashboard README.
 
 For deploying the dashboard to a public domain (staging or production),
 see [`HowToDeploy.md`](HowToDeploy.md) — covers PaaS (Fly.io / Railway),

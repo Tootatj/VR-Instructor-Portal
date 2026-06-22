@@ -1,7 +1,7 @@
 # How to Deploy the VR Instructor Portal Web Stack to a Public Domain
 
 > **Last verified against:** Node.js 20+ · Express 5 · Socket.IO 4 · `Web_Dashboard/`
-> git rev `<this commit>` (Phase 6D + 2026-06-08 closeout)
+> git rev `<this commit>` (Phase 7 cross-vendor VR closeout + ops docs refresh)
 >
 > **Maintainer rule:** every time `Web_Dashboard/server.js`, `src/auth.js`,
 > `src/tenants.js`, `src/pairing.js`, `.env.example`, or the deployable
@@ -932,6 +932,7 @@ Append a row when this guide's prescriptions change (new recipe, new gotcha lear
 
 | Date | Commit | What changed |
 |---|---|---|
+| 2026-06-22 | `<this commit>` | Local-dev note: stock Windows PowerShell may block `npm` scripts (`ExecutionPolicy`); `node server.js` from `Web_Dashboard/` is equivalent to `npm start` / `npm run dev` (without `--watch`). Cross-ref root `README.md` self-service VR cook workflow. |
 | 2026-06-11 | `<this commit>` | Rewrote section D.9 from a placeholder ("coordinate with the VR dev to wire …") into a step-by-step actionable checklist. Two of the three Phase 1 Agora cost mitigations now ship in code (`UHeadsetPresenceMonitor` C++ component + `grid.js` visibilitychange handler + two new BP-callable methods on `USignalingSubsystem`), so D.9 collapses to: (1) one manual console click for the billing alert with the literal click-path, and (2) a verbatim BP-wiring spec for the VR dev (drag in `UHeadsetPresenceMonitor` + 2 event bindings) with cross-vendor verification steps. Section is now self-contained — no requirement to read the Devlog audit entry to act on it. |
 | 2026-06-08 | `76940b7` | Added section D.9 (Agora cost-exposure mitigations) to the hardening checklist after the audit captured in Devlog 2026-06-08. Spans both sides of the deploy (headset HMD-worn-state idle detection + browser visibilitychange unsubscribe) so the web dev doing the deploy doesn't miss the VR-side coordination point. |
 | 2026-06-08 | `41b3744` | Initial guide. Four recipes (A: PaaS / B: VPS / C: subpath-embedded / D: hardening checklist), integration-touchpoint section with the VR developer, 10 common gotchas pinned in advance, operational topics (tenant management / backups / updates / monitoring / cred rotation). Created because `HowToPort.md` explicitly disclaims web deploy and the Web_Dashboard/README.md only covers local dev — a web-developer handoff needed a parallel doc. |

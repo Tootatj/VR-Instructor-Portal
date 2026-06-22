@@ -78,6 +78,13 @@ npm run dev            # node --watch — auto-restarts on file change
 npm start              # production-style: one boot, no hot reload
 ```
 
+On Windows, if PowerShell blocks `npm` (`running scripts is disabled on this
+system`), run the same entry point directly:
+
+```bash
+node server.js         # equivalent to npm start
+```
+
 Open `http://localhost:3000`. The grid view loads, empty until something
 registers. Click **Spawn demo sessions** in the header (or open
 `/faker.html?spawn=5` directly) to populate it.

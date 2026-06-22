@@ -2,9 +2,9 @@
 
 ## Current Project Status
 
-**Phase:** Per-app interactive control plane shipped (2026-06-15) — **VR ↔ dashboard bidirectional JSON protocol live, verified end-to-end in PIE.** Headsets publish state transitions via `USignalingSubsystem::EmitStateUpdate` (or the JSON-string overload `EmitStateUpdateFromJson`), the server caches per-room state and fans out `session:state-changed` to subscribed instructors, the dashboard dynamically loads a per-`appId` UI module (first concrete one: `apps/VRFT.js` covering the 5-state fire-training machine) that renders the right control surface for whatever state the headset reports. Instructor-side commands route back through the existing `instructor:command` → `headset:command` path with app-scoped validation (`APP_COMMAND_VALIDATORS[appId]`). Test rig walks the loop: instructor clicks "Level 02" on a hub-state VRFT tile → headset loads the map → level's `BeginPlay` republishes state → dashboard transitions from level-picker to return-to-hub view. Session isolation verified by code-keyed routing at all three layers (web → server → VR → server → web).
+**Phase:** Phase 7 instructor-view rebuild **closed cross-vendor (2026-06-22)** — frame-hijacking stream verified on **Quest 3** (2026-06-18) and **Pico 4 Enterprise** (2026-06-22). Per-app interactive control plane (2026-06-15) remains live: headsets publish state via `EmitStateUpdate` / `EmitStateUpdateFromJson`, dashboard loads per-`appId` UI (`VRFT.js`), instructor commands route through app-scoped validation. **Known open item:** malformed `Format Text` JSON in `BP_VRPawn` can drop `data` fields on state updates (level picker metadata) — fix in editor or via a small C++ helper; a prior dashboard-side sync fix was reverted after it caused a focus-view "connecting" hang.
 
-**Prior phases all closed.** Phase 1 (Agora cost-exposure mitigations: HMD presence + delegate-driven idle detection + browser visibility unsubscribe) shipped 2026-06-11 and cross-vendor verified on Quest 3 + Pico 4 Enterprise. Phase 6D (channel-swap fix + tenant registry + universal-APK HMD priority via per-device cook wrapper) closed 2026-06-08. Phase 3 (Agora video streaming) closed 2026-06-03. Build & deployment pipeline validated end-to-end on Quest 3 + Pico 4E. Project is Blueprint + minimal C++ scaffolding (Agora plugin compile chain — see 2026-06-01 first entry). Pinned plugin version is **v4.5.1**. Canonical port guide lives in `HowToPort.md`; deployment ops in `HowToDeploy.md`; per-app protocol in `Web_Dashboard/docs/state-updates.md` + `commands.md`.
+**Prior phases all closed.** Phase 1 (Agora cost-exposure mitigations) shipped 2026-06-11. Phase 6D (channel-swap + per-device cook wrapper) closed 2026-06-08. Phase 3 (Agora video streaming) closed 2026-06-03. Pinned Agora plugin **v4.5.1**. Canonical port guide: `HowToPort.md`; deploy ops: `HowToDeploy.md`; wire protocol: `Web_Dashboard/docs/state-updates.md` + `commands.md`.
 
 This developer log tracks completed environment engineering, architectural constraints, resolved pipeline blockers, and current session work for the **VR Instructor Portal** project.
 
@@ -1004,13 +1004,28 @@ Logcat signatures on a healthy session: `RenderHijacking: Started. Output=1280x7
 
 **C++ additions beyond colleague drop-in:** `GetRecommendedInputResolution()` static helper (Quest 1720×1760 / Pico 1500×1850 via active `IXRTrackingSystem` name, not enabled-plugin probe); `Renderer` module dep in `Build.cs`; `AgoraVideoPump` diagnostic logs (`SourceRT` path + first-frame BGRA sample on pump start).
 
-**Still open (not blocking Quest verification):**
+**Still open (not blocking cross-vendor stream verification):**
 
-- Pico 4 Enterprise stream smoke on the hijack path (expected to work — extension is vendor-agnostic; MR toggle expected to no-op).
-- Phase 6 cleanup: delete disabled `SceneCaptureComponent2D`, `RT_InstructorStream`, `M_RTStreamDebug` once Pico is green.
+- Phase 6 cleanup: delete disabled `SceneCaptureComponent2D`, `RT_InstructorStream`, `M_RTStreamDebug` once comfortable with the hijack path on both vendors.
 - `AndroidPermission` plugin enablement in `.uproject` if `Check Permission` nodes need to resolve on a clean clone (Quest MR camera path).
+- VRFT `BP_VRPawn` state-update JSON (`Format Text` → `EmitStateUpdateFromJson`) — malformed strings drop `data` on the dashboard; needs a targeted BP or C++ fix (do **not** reintroduce the reverted dashboard state-sync patch — it caused focus-view "connecting" hangs).
 
 **Files in this milestone:** `RenderHijackingSubsystem.*`, `SceneColorCopyViewExtension.*`, `Content/InstructorView/*`, `BP_VRPawn` wiring, `AgoraVideoPump` diagnostics, `DefaultEngine.ini` (CAMERA perm + CoreRedirects), dashboard `set_mr_mode` plumbing, `.cursorrules` / `HowToPort.md` video-pipeline updates.
+
+---
+
+### 2026-06-22 (verified) — Phase 7 cross-vendor closeout: Pico 4 Enterprise + ops docs
+
+Re-verified the Phase 7 hijack → composite → Agora pipeline on **Pico 4 Enterprise** (`PA8E50MGH1111100D`) via `Tools/Cook-VRApp.ps1 -Device pico`. Same UAT pipeline as Quest; only `[HMDPluginPriority]` differs for the cook (`OpenXR=0`, `PICOXRHMD=10`), restored to Quest baseline by the wrapper's `finally` block. APK archived as `VR_Project-Pico-arm64.apk` alongside the Quest build.
+
+**Content tweaks in this submission:** hub/level map updates under `VRTemplate/Maps/` + new `M_Invisible` material (collision/visual pass for instructor-view child actor integration).
+
+**Operational docs refresh:** root `README.md` build section now documents the full self-service cook workflow (close UE Editor first, `DefaultEngine.ini` must be git-clean, `-ExecutionPolicy Bypass` alternative, co-existing Quest/Pico APK names). `HowToPort.md` / `HowToDeploy.md` change logs updated. `Web_Dashboard/README.md` notes `node server.js` when stock PowerShell blocks `npm` scripts.
+
+**Build gotchas reconfirmed on the bench:**
+- UE Editor must be closed — Live Coding blocks Android compiles (`Unable to build while Live Coding is active`).
+- `Cook-VRApp.ps1` refuses to run if `DefaultEngine.ini` has uncommitted edits (stash/commit first).
+- Dashboard local dev: `node server.js` from `Web_Dashboard/` → `http://localhost:3000`.
 
 ---
 
