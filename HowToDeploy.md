@@ -789,6 +789,40 @@ first production rollout. P2 becomes interesting around customer #2.
 
 ---
 
+## Production instructor workflow (multi-site, no network filter)
+
+This is the **intended v1 product behaviour** once deployed to a public URL.
+LAN-only dev (`http://<lan-ip>:3000` + headsets on the same Wi‑Fi) is a
+developer convenience, not the production model.
+
+1. **Instructor opens one shared URL** — e.g. `https://instructor.onebonsai.com`.
+2. **Instructor signs in with their company registration code** — e.g.
+   `5555555555` (mapped to tenant `securitas` in `data/tenant-codes.json`).
+3. **Dashboard shows every live VR session for that tenant** in the grid —
+   regardless of where the headset is (office A, office B, home, mobile
+   hotspot, another country). There is **no** “same network only” filter in
+   v1; session visibility is **tenant-scoped**, not location-scoped.
+
+**How it works under the hood:**
+
+| Plane | Behaviour |
+|---|---|
+| **Signaling / grid** | Headsets call `headset:register` on the central server with their `tenantId`. Instructors call `instructor:subscribe-tenant` after cookie login. The server fans out `sessions:changed` to all instructors in that tenant's Socket.IO room — every registered room with matching `tenantId` appears. |
+| **Video / audio** | Agora WebRTC via the cloud. Channels are named `t-<tenantId>-<pairingCode>`. Geographic separation is normal; no LAN requirement. |
+| **Isolation** | Instructor A (`5555555555` → `securitas`) never sees sessions from instructor B (`7777777777` → `customerx`). Pairing codes are unique per session but scoped inside the tenant. |
+
+**What must be true for remote sites to appear:**
+
+- The **same public signaling URL** is reachable from every headset and every instructor browser.
+- VR APKs are cooked with that URL in `ServerUrl` (not a `192.168.x.x` address).
+- Each headset completed **first-launch tenant binding** with the company's registration code (Phase 6D `UTenantRegistry`).
+
+No product changes are required for this workflow — it ships with Phase 6.
+Deploying to a public domain (recipes A/B/C above) plus a VR re-cook is
+what turns it on.
+
+---
+
 ## Integration touchpoint with the VR side
 
 This section is the **handoff contract** with whoever is doing the
@@ -932,6 +966,7 @@ Append a row when this guide's prescriptions change (new recipe, new gotcha lear
 
 | Date | Commit | What changed |
 |---|---|---|
+| 2026-06-22 | `<this commit>` | Added **Production instructor workflow (multi-site, no network filter)** — documents the v1 model: one public URL, company-code login, grid shows all tenant sessions worldwide. Explicitly defers any LAN-only / site filter toggle. |
 | 2026-06-22 | `<this commit>` | Local-dev note: stock Windows PowerShell may block `npm` scripts (`ExecutionPolicy`); `node server.js` from `Web_Dashboard/` is equivalent to `npm start` / `npm run dev` (without `--watch`). Cross-ref root `README.md` self-service VR cook workflow. |
 | 2026-06-11 | `<this commit>` | Rewrote section D.9 from a placeholder ("coordinate with the VR dev to wire …") into a step-by-step actionable checklist. Two of the three Phase 1 Agora cost mitigations now ship in code (`UHeadsetPresenceMonitor` C++ component + `grid.js` visibilitychange handler + two new BP-callable methods on `USignalingSubsystem`), so D.9 collapses to: (1) one manual console click for the billing alert with the literal click-path, and (2) a verbatim BP-wiring spec for the VR dev (drag in `UHeadsetPresenceMonitor` + 2 event bindings) with cross-vendor verification steps. Section is now self-contained — no requirement to read the Devlog audit entry to act on it. |
 | 2026-06-08 | `76940b7` | Added section D.9 (Agora cost-exposure mitigations) to the hardening checklist after the audit captured in Devlog 2026-06-08. Spans both sides of the deploy (headset HMD-worn-state idle detection + browser visibilitychange unsubscribe) so the web dev doing the deploy doesn't miss the VR-side coordination point. |
